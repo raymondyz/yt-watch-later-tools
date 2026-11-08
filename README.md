@@ -1,79 +1,53 @@
 # Watch Later Shuffle
 
-A Chrome extension (Manifest V3) that permanently shuffles the stored order of your YouTube Watch Later playlist, so the new order shows on every device. It backs up the original order before each shuffle and can restore it.
+A Chrome extension (Manifest V3) that permanently shuffles the saved order of a YouTube playlist you own, including Watch Later. The new order is stored on YouTube, so it shows on every device. It backs up the current order before each shuffle and can restore it.
 
-**Status:** the core flow is finished and passed the manual tests below on a signed-in account on 2026-11-07. For now it runs from the DevTools console. The floating UI (`src/ui.js`) is not built yet, and stays out of `manifest.json` until it exists, because Chrome refuses to load an extension when a listed file is missing.
+This is not YouTube's own Shuffle button. That one plays a playlist in random order once and leaves the playlist unchanged. This extension changes the playlist itself.
 
-## Load the extension
+## Install
 
 1. Open `chrome://extensions` and turn on Developer mode.
 2. Click **Load unpacked** and select this repository's root folder, the one containing `manifest.json`.
 3. Reload any open YouTube tabs.
 
-## Manual tests
+## Use it
 
-Run these in order, signed in, in the DevTools console of any youtube.com tab. Use a throwaway playlist: do not touch Watch Later until all of them pass. Replace `PL...` with the throwaway playlist's id.
+1. Open a playlist you own. Watch Later is at `https://www.youtube.com/playlist?list=WL`.
+2. Click the purple **Shuffle playlist order** button at the bottom right. It opens a panel that explains what will happen and names the playlist.
+3. Click **Shuffle order...**, check the question, and confirm. A backup of the current order is saved first.
+4. Watch the progress bar. **Stop** is safe at any point: every move leaves a complete playlist, just partly reordered.
+5. When it says Done, click **Reload page** to see the new order.
 
-**1. Check that the extension is loaded.**
+To undo a shuffle, use the **Backups** list in the same panel. Each backup shows when it was saved and has its own **Restore** button, which asks before changing anything.
 
-```js
-__wlShuffle.config
+## Testing changes
+
+Run the automated tests:
+
+```sh
+node --test test/
 ```
 
-**2. Read the throwaway playlist.** Create a playlist with about 10 videos, then:
+`test/core.test.js` covers the pure logic. `test/flow.test.js` runs the real `innertube.js` and `main.js` against a simulated YouTube backend, covering retries, pause and resume, stop, verify and repair, restore, and the panel's wiring. `ui.js` needs a real page, so check it by hand.
 
-```js
-await __wlShuffle.fetchPlaylist('PL...')
-```
+After changing anything that talks to YouTube, repeat these manual tests, signed in, on a throwaway playlist of about 10 videos before using Watch Later:
 
-Expect one item per video, each with `setVideoId`, `videoId` and `title`. If this throws "did not include the setVideoId", see [If reading fails](#if-reading-fails).
+1. **Read.** In the DevTools console, run `await __wlShuffle.fetchPlaylist('PL...')` with the playlist's id. Expect one item per video, each with a `setVideoId`. If it throws "did not include the setVideoId", see [If reading fails](#if-reading-fails).
+2. **Shuffle** from the panel. Reload and check the order changed and no videos are missing.
+3. **Restore** the latest backup from the panel. Reload and check the original order is back.
+4. **Stop midway.** Run `__wlShuffle.config.delayMs = 1500` to slow it down, shuffle from the panel, then click **Stop**. Reload, check nothing is missing, and restore.
 
-**3. Read Watch Later.** This only reads, so it is safe, and it answers the biggest open question below.
-
-```js
-(await __wlShuffle.fetchPlaylist()).length
-```
-
-**4. Shuffle.** Accept the dialog. A backup is saved before the first move.
-
-```js
-const result = await __wlShuffle.run({ playlistId: 'PL...' });
-console.table(result.target.map((video) => video.title));
-```
-
-Expect `result.status` to be `'done'`. Reload the playlist page and confirm its order matches the table.
-
-**5. Restore.**
-
-```js
-await __wlShuffle.restore({ playlistId: 'PL...' })
-```
-
-Reload and confirm the original order is back.
-
-**6. Cancel midway.** The longer delay gives you time to cancel. Accept the dialog, then run the second part.
-
-```js
-__wlShuffle.config.delayMs = 1500;
-const pending = __wlShuffle.run({ playlistId: 'PL...' });
-```
-
-```js
-__wlShuffle.cancel();
-await pending;
-```
-
-Reload and confirm no videos are missing, then restore as in step 5.
-
-## If a test fails
+## If something fails
 
 ### If reading fails
 
 Open `https://www.youtube.com/playlist?list=WL`, run `copy(JSON.stringify(ytInitialData))` in the console, and paste the result into `fixtures/initial_data.json`. That one file shows where `setVideoId` is now. Spec section 4 lists the other useful captures. Git ignores `fixtures/` because captures contain your playlist. Never save cookie or `Authorization` values.
 
+A playlist you don't own fails the same way, because YouTube leaves out the ids needed to move its videos. That is expected.
+
 ### If moves fail
 
-- **HTTP 401 or 403:** compare your `Authorization` header with a real drag request, or try the fallback transport below.
+- **HTTP 401 or 403:** compare your `Authorization` header with a real drag request, or switch to the fallback transport: run `localStorage.setItem('wls:config', '{"transport":"ytAction"}')` and reload.
 - **HTTP 400 or "did not confirm the move":** drag one video by hand, then compare the `browse/edit_playlist` request and response with spec section 5.5. YouTube may need an extra field in the body, or may report success differently.
 
 ## What has been verified
@@ -97,12 +71,14 @@ Checked on 2026-11-06 against client version `2.20261030.02.00`, without signing
 | Displayed video count | Confirmed on live pages | Read from `playlistSidebarPrimaryInfoRenderer.stats`. |
 | `yt-action` fallback transport | Partly confirmed | `yt-service-request` is in the client, but the fallback has not been run. |
 | MAIN world injection, `ytcfg`, Trusted Types | Confirmed in Chromium | Loaded on live youtube.com, signed out. |
+| Panel: shuffle, restore, stop, themes, navigation | Confirmed in Chromium | Driven on a live youtube.com playlist page with the playlist requests answered by a mock, on 2026-11-07. |
 
 ## Updating for YouTube changes
 
 - Every undocumented name is in the frozen `INNERTUBE` block at the top of `src/core.js`. It lives there rather than in `innertube.js` because `core.js` loads first, needs the names itself, and must run under Node.
 - If a response shape changes, adjust the parser in `src/core.js`, then add the new shape to `test/core.test.js`.
 - Files in `fixtures/` are picked up by the tests automatically: `initial_data.json` and `browse_continuation.response.json`.
+- The panel does not depend on YouTube's page structure. It only needs the URL to be `/playlist?list=...`.
 
 ## Configuration
 
@@ -125,7 +101,7 @@ localStorage.setItem('wls:config', JSON.stringify({ debug: true }));
 
 ## Console API
 
-Available as `__wlShuffle` on any youtube.com page.
+Everything the panel does is also available as `__wlShuffle` on any youtube.com page.
 
 | Function | Purpose |
 | --- | --- |
@@ -133,28 +109,17 @@ Available as `__wlShuffle` on any youtube.com page.
 | `run({ playlistId = 'WL' } = {})` | Full shuffle: confirm, backup, move, verify |
 | `restore({ playlistId = 'WL' } = {})` | Restores the latest saved backup |
 | `restoreFromBackup(backupObject)` | Restores from a backup object, such as an older saved backup |
-| `cancel()` | Cancels the current run |
+| `cancel()` | Stops the current run |
 | `resume()` | Continues a paused run, or retries one that ended with items out of place |
 | `config` | The effective config |
 
+A run started from the console still opens the panel, and asks its question there.
+
 ## Good to know
 
-- **Keep the tab in the foreground during long runs.** Chrome throttles timers in background tabs, so a run slows down sharply there. It stays safe, just slow.
-- **A paused run keeps its `run()` promise pending** until you call `resume()` or `cancel()`.
+- **Keep the tab open, and preferably in view, during long runs.** Chrome throttles timers in background tabs, so a run slows down sharply there. It stays safe, just slow. Closing the tab asks first.
+- **You can browse elsewhere on YouTube during a run.** The panel stays visible and keeps going.
 - **Backups live only in this browser,** in youtube.com's `localStorage`, newest first. Clearing YouTube's site data deletes them, and only the last `backupsToKeep` are kept per playlist.
 - **A shuffle never runs without a backup.** If the backup can't be saved, for example because storage is full, the run stops before changing anything.
-- **Restore does not create a new backup,** so repeated restores keep returning to the same order. After two shuffles, the newest backup is the first shuffled order. To get further back, restore an older backup:
-
-  ```js
-  const backups = JSON.parse(localStorage.getItem('wls:backup:WL'));
-  await __wlShuffle.restoreFromBackup(backups[1]); // [0] is the newest
-  ```
-- **Cancelling never loses videos.** Each move leaves a valid playlist, only partly reordered.
-
-## Tests
-
-```sh
-node --test test/
-```
-
-`test/core.test.js` covers the pure logic. `test/flow.test.js` runs the real `innertube.js` and `main.js` against a simulated YouTube backend, covering retries, pause and resume, cancel, verify and repair, and restore. Neither proves the live InnerTube contract: the manual tests above do that.
+- **Restore does not create a new backup,** so repeated restores keep returning to the same order. After two shuffles, the newest backup is the first shuffled order: restore the older one to get further back.
+- **Stopping never loses videos.** Each move leaves a valid playlist, only partly reordered.

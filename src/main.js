@@ -20,23 +20,55 @@
   let activeJob = null;
   let retryable = null;
 
-  const view = { phase: 'idle', done: 0, total: 0, status: '', statusKind: 'info' };
+  const view = { phase: 'idle', done: 0, total: 0, status: '', statusKind: 'info', playlistLabel: '' };
 
   function log(...args) {
     if (CONFIG.debug) console.log('[wls]', ...args);
   }
 
-  function isWatchLaterPage() {
+  // The playlist whose page is open, or null on any other page.
+  function currentPlaylistId() {
     const { pathname, search } = root.location;
-    return pathname === '/playlist' && new URLSearchParams(search).get('list') === WATCH_LATER;
+    if (pathname !== '/playlist') return null;
+    return new URLSearchParams(search).get('list') || null;
+  }
+
+  function playlistLabel(playlistId) {
+    if (playlistId === WATCH_LATER) return 'Watch later';
+    if (playlistId !== currentPlaylistId()) return playlistId;
+    const match = document.title.match(/^(?:\(\d+\)\s*)?(.+?)\s+-\s+YouTube$/);
+    return match ? match[1] : playlistId;
+  }
+
+  function formatDate(iso) {
+    return new Date(iso).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' });
+  }
+
+  function loadBackups(playlistId) {
+    try {
+      const backups = JSON.parse(localStorage.getItem(BACKUP_PREFIX + playlistId));
+      return Array.isArray(backups) ? backups : [];
+    } catch (err) {
+      return [];
+    }
+  }
+
+  function describeBackups(playlistId) {
+    return loadBackups(playlistId).map((backup) => ({
+      label: formatDate(backup.createdAt),
+      count: Array.isArray(backup.items) ? backup.items.length : 0
+    }));
   }
 
   function refreshView() {
+    const pagePlaylist = currentPlaylistId();
+    const idle = !running && pagePlaylist !== null;
     ns.ui?.render({
       ...view,
-      visible: running || isWatchLaterPage(),
-      canRestore: !running && loadBackups(WATCH_LATER).length > 0,
-      canRetry: !running && retryable !== null
+      visible: running || pagePlaylist !== null,
+      playlistLabel: running ? view.playlistLabel : (pagePlaylist && playlistLabel(pagePlaylist)) || '',
+      backups: idle ? describeBackups(pagePlaylist) : [],
+      canRetry: idle && retryable?.playlistId === pagePlaylist
     });
   }
 
@@ -53,15 +85,6 @@
       total: job.total,
       status: `Moving ${job.done} / ${job.total}`
     });
-  }
-
-  function loadBackups(playlistId) {
-    try {
-      const backups = JSON.parse(localStorage.getItem(BACKUP_PREFIX + playlistId));
-      return Array.isArray(backups) ? backups : [];
-    } catch (err) {
-      return [];
-    }
   }
 
   // A shuffle never starts without a backup, so a failure here stops the run.
@@ -81,6 +104,7 @@
     const abort = new AbortController();
     const job = {
       playlistId,
+      label: playlistLabel(playlistId),
       abort,
       signal: abort.signal,
       target: [],
@@ -235,7 +259,8 @@
     if (err instanceof CancelledError) {
       update({
         phase: 'cancelled',
-        status: `Cancelled at ${job.done} / ${job.total}. No videos were lost, but the order is only partly changed.`
+        status: `Stopped at ${job.done} / ${job.total}. No videos were lost, but the order is only `
+          + 'partly changed. Restore the latest backup to undo it.'
       });
       return { status: 'cancelled' };
     }
@@ -257,7 +282,13 @@
     root.addEventListener('beforeunload', warnBeforeUnload);
     try {
       activeJob = createJob(playlistId);
-      update({ phase: 'reading', done: 0, total: 0, status: 'Reading the playlist...' });
+      update({
+        phase: 'reading',
+        done: 0,
+        total: 0,
+        status: 'Reading the playlist...',
+        playlistLabel: activeJob.label
+      });
       return await body(activeJob);
     } catch (err) {
       return endWithError(err, activeJob ?? { done: 0, total: 0 });
@@ -275,6 +306,13 @@
       + 'This is normal when some videos are hidden or unavailable.';
   }
 
+  // Asks in the panel when the UI is loaded, and with the browser's dialog otherwise.
+  function askConfirm(request, signal) {
+    if (ns.ui?.confirm) return ns.ui.confirm(request, signal);
+    const text = [request.title, request.message, request.warning].filter(Boolean).join('\n\n');
+    return Promise.resolve(root.confirm(text));
+  }
+
   function run({ playlistId = WATCH_LATER } = {}) {
     return exclusive(playlistId, async (job) => {
       const { items, displayedCount } = await readFresh(job);
@@ -284,9 +322,16 @@
       }
       const warning = countWarning(items.length, displayedCount);
       if (warning) console.warn(`[wls] ${warning}`);
-      const question = `Shuffle ${items.length} videos? This changes the order on YouTube `
-        + 'on all devices. A backup will be saved first.';
-      if (!root.confirm(warning ? `${question}\n\n${warning}` : question)) {
+      update({ phase: 'confirm', status: '' });
+      const confirmed = await askConfirm({
+        title: `Shuffle the order of "${job.label}"?`,
+        message: `This permanently rearranges its ${items.length} videos into a random order and `
+          + 'saves it on YouTube, so the new order shows on all your devices. This is not shuffle '
+          + 'play. A backup of the current order is saved first, so you can restore it.',
+        warning,
+        confirmLabel: `Shuffle ${items.length} videos`
+      }, job.signal);
+      if (!confirmed) {
         update({ phase: 'idle', status: '' });
         return { status: 'declined' };
       }
@@ -330,21 +375,46 @@
     return (await it.readPlaylist(playlistId)).items;
   }
 
+  // Restoring from the panel asks first: it is one click away and does not
+  // back up the current order.
+  async function restoreFromPanel(index) {
+    const playlistId = currentPlaylistId();
+    const backup = loadBackups(playlistId)[index];
+    if (!backup) throw new Error('That backup is no longer available.');
+    const confirmed = await askConfirm({
+      title: 'Restore this saved order?',
+      message: `This puts the videos in "${playlistLabel(playlistId)}" back in the order saved on `
+        + `${formatDate(backup.createdAt)}, on YouTube and all your devices. Videos added since then `
+        + 'go to the top. The current order is not backed up first.',
+      confirmLabel: 'Restore order'
+    });
+    return confirmed ? restoreFromBackup(backup) : { status: 'declined' };
+  }
+
   function reportClickError(err) {
     console.error('[wls]', err);
     update({ status: err.message, statusKind: 'error' });
   }
 
   function watchNavigation() {
-    let lastHref = root.location.href;
+    const pageKey = () => `${root.location.href}\n${document.title}`;
+    let lastKey = pageKey();
+    let lastPlaylist = currentPlaylistId();
     const onNavigate = () => {
-      lastHref = root.location.href;
+      lastKey = pageKey();
+      const playlistId = currentPlaylistId();
+      // A finished run's message belongs to its playlist, not the next one.
+      if (!running && playlistId !== lastPlaylist) {
+        retryable = null;
+        Object.assign(view, { phase: 'idle', done: 0, total: 0, status: '', statusKind: 'info' });
+      }
+      lastPlaylist = playlistId;
       refreshView();
     };
     document.addEventListener('yt-navigate-finish', onNavigate);
     root.addEventListener('popstate', onNavigate);
     setInterval(() => {
-      if (root.location.href !== lastHref) onNavigate();
+      if (pageKey() !== lastKey) onNavigate();
     }, 1000);
   }
 
@@ -359,10 +429,13 @@
   });
 
   ns.ui?.mount({
-    onShuffle: () => run().catch(reportClickError),
-    onRestore: () => restore().catch(reportClickError),
-    onCancel: cancel,
-    onResume: () => Promise.resolve(resume()).catch(reportClickError),
+    onShuffle: () => {
+      const playlistId = currentPlaylistId();
+      return playlistId ? run({ playlistId }).catch(reportClickError) : Promise.resolve();
+    },
+    onRestore: (index) => restoreFromPanel(index).catch(reportClickError),
+    onStop: cancel,
+    onResume: () => Promise.resolve().then(resume).catch(reportClickError),
     onReload: () => root.location.reload()
   });
 

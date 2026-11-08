@@ -74,12 +74,14 @@ function createServer(order) {
   return server;
 }
 
-function load(server, { confirmAnswer = true, config = {}, storageFull = false, href } = {}) {
+function load(server, options = {}) {
+  const { confirmAnswer = true, config = {}, storageFull = false, href, uiConfirm } = options;
   const storage = new Map();
   if (Object.keys(config).length > 0) storage.set('wls:config', JSON.stringify(config));
   const views = [];
   const events = [];
   const unloadListeners = new Set();
+  const documentListeners = new Map();
   const ytcfgData = { INNERTUBE_CONTEXT: { client: {} }, SESSION_INDEX: 0 };
   const url = new URL(href ?? 'https://www.youtube.com/');
   const sandbox = {
@@ -109,7 +111,10 @@ function load(server, { confirmAnswer = true, config = {}, storageFull = false, 
     },
     document: {
       cookie: 'SAPISID=abc; __Secure-1PAPISID=def; __Secure-3PAPISID=ghi',
-      addEventListener() {},
+      title: 'My Mix - YouTube',
+      addEventListener(type, listener) {
+        documentListeners.set(type, [...(documentListeners.get(type) ?? []), listener]);
+      },
       querySelector: () => ({ dispatchEvent: (event) => events.push(event) })
     },
     addEventListener(type, listener) {
@@ -131,6 +136,7 @@ function load(server, { confirmAnswer = true, config = {}, storageFull = false, 
     },
     render: (state) => views.push(state)
   };
+  if (uiConfirm) sandbox.__wlShuffle.ui.confirm = uiConfirm;
   vm.runInContext(fs.readFileSync(path.join(SRC, 'main.js'), 'utf8'), context);
   return {
     api: sandbox.__wlShuffle,
@@ -140,6 +146,13 @@ function load(server, { confirmAnswer = true, config = {}, storageFull = false, 
     unloadListeners,
     ytcfgData,
     lastView: () => views.at(-1),
+    handlers: () => sandbox.__wlShuffle.ui.handlers,
+    // Stands in for a YouTube navigation inside the single-page app.
+    navigate(nextHref, title = 'My Mix - YouTube') {
+      url.href = nextHref;
+      sandbox.document.title = title;
+      for (const listener of documentListeners.get('yt-navigate-finish') ?? []) listener();
+    },
     backups: (id = 'WL') => JSON.parse(storage.get(`wls:backup:${id}`) ?? '[]')
   };
 }
@@ -511,7 +524,7 @@ describe('cancel', () => {
     assert.equal(result.status, 'cancelled');
     assert.equal(server.edits, 4);
     assert.deepEqual(sorted(server.order), sorted(ids(12)));
-    assert.match(lastView().status, /^Cancelled at 4 \/ \d+/);
+    assert.match(lastView().status, /^Stopped at 4 \/ \d+/);
   });
 
   it('can be followed by a restore', async () => {
@@ -539,7 +552,7 @@ describe('verify', () => {
 
   it('reports items out of place when repair fails, and can retry', async () => {
     const server = createServer(ids(12));
-    const { api, lastView } = load(server);
+    const { api, lastView } = load(server, { href: 'https://www.youtube.com/playlist?list=WL' });
     let dropping = true;
     server.onEdit = () => (dropping ? json({ status: 'STATUS_SUCCEEDED' }) : undefined);
     const result = await api.run();
@@ -628,12 +641,13 @@ describe('ytAction transport', () => {
   });
 });
 
-describe('visibility', () => {
-  it('shows on Watch Later and while running, and hides elsewhere', async () => {
-    const onWatchLater = load(createServer(ids(3)), {
-      href: 'https://www.youtube.com/playlist?list=WL'
-    });
-    assert.equal(onWatchLater.lastView().visible, true);
+describe('page wiring', () => {
+  const MIX = 'https://www.youtube.com/playlist?list=PLmix';
+
+  it('shows on any playlist page and while running, and hides elsewhere', async () => {
+    const onPlaylist = load(createServer(ids(3)), { href: MIX });
+    assert.equal(onPlaylist.lastView().visible, true);
+    assert.equal(onPlaylist.lastView().playlistLabel, 'My Mix');
 
     const server = createServer(ids(6));
     const elsewhere = load(server);
@@ -642,16 +656,126 @@ describe('visibility', () => {
     server.onEdit = () => {
       shownDuringRun = elsewhere.lastView().visible;
     };
-    await elsewhere.api.run();
+    await elsewhere.api.run({ playlistId: 'PLother' });
     assert.equal(shownDuringRun, true);
     assert.equal(elsewhere.lastView().visible, false);
   });
 
-  it('offers restore only when a Watch Later backup exists', async () => {
+  it('names Watch Later, the open playlist, and other playlists by id', async () => {
+    const server = createServer(ids(3));
+    const { api, navigate, lastView } = load(server, { href: MIX });
+    let label = null;
+    server.onEdit = () => {
+      label = lastView().playlistLabel;
+    };
+    await api.run({ playlistId: 'PLelsewhere' });
+    assert.equal(label, 'PLelsewhere');
+    navigate('https://www.youtube.com/playlist?list=WL', 'Watch later - YouTube');
+    assert.equal(lastView().playlistLabel, 'Watch later');
+    navigate(MIX, '(3) My Mix - YouTube');
+    assert.equal(lastView().playlistLabel, 'My Mix');
+  });
+
+  it('shuffles the open playlist from the panel', async () => {
     const server = createServer(ids(6));
-    const { api, lastView } = load(server);
-    assert.equal(lastView().canRestore, false);
-    await api.run();
-    assert.equal(lastView().canRestore, true);
+    const { handlers, lastView } = load(server, { href: MIX });
+    const edited = new Set();
+    server.onEdit = (_, body) => {
+      edited.add(body.playlistId);
+    };
+    await handlers().onShuffle();
+    assert.equal(lastView().phase, 'done');
+    assert.deepEqual([...edited], ['PLmix']);
+  });
+
+  it('lists the open playlist\'s backups, newest first', async () => {
+    const server = createServer(ids(6));
+    const { api, lastView, backups } = load(server, { href: MIX });
+    assert.equal(lastView().backups.length, 0);
+    await api.run({ playlistId: 'PLmix' });
+    server.order.pop();
+    await api.run({ playlistId: 'PLmix' });
+    const listed = lastView().backups;
+    assert.equal(listed.length, 2);
+    assert.equal(listed[0].count, 5);
+    assert.equal(listed[1].count, 6);
+    assert.equal(listed[0].label, new Date(backups('PLmix')[0].createdAt).toLocaleString([], {
+      dateStyle: 'medium',
+      timeStyle: 'short'
+    }));
+  });
+
+  it('restores the chosen backup from the panel after confirming', async () => {
+    const server = createServer(ids(8));
+    const asked = [];
+    const { api, handlers } = load(server, {
+      href: MIX,
+      uiConfirm: async (request) => {
+        asked.push(request);
+        return true;
+      }
+    });
+    await api.run({ playlistId: 'PLmix' });
+    await api.run({ playlistId: 'PLmix' });
+    const result = await handlers().onRestore(1);
+    assert.equal(result.status, 'done');
+    assert.deepEqual(server.order, ids(8));
+    assert.equal(asked.at(-1).confirmLabel, 'Restore order');
+    assert.match(asked.at(-1).message, /"My Mix" back in the order saved on/);
+  });
+
+  it('does not restore when the confirmation is declined', async () => {
+    const server = createServer(ids(8));
+    const answers = [true, false];
+    const { api, handlers } = load(server, { href: MIX, uiConfirm: async () => answers.shift() });
+    await api.run({ playlistId: 'PLmix' });
+    const shuffled = server.order.slice();
+    const edits = server.edits;
+    assert.equal((await handlers().onRestore(0)).status, 'declined');
+    assert.equal(server.edits, edits);
+    assert.deepEqual(server.order, shuffled);
+  });
+
+  it('asks the panel to confirm and lets Stop dismiss the question', async () => {
+    const server = createServer(ids(5));
+    let asked = null;
+    const { api, backups } = load(server, {
+      href: MIX,
+      uiConfirm: (request, signal) => new Promise((resolve) => {
+        asked = request;
+        signal.addEventListener('abort', () => resolve(false));
+      })
+    });
+    const pending = api.run({ playlistId: 'PLmix' });
+    await waitFor(() => asked !== null);
+    assert.equal(asked.title, 'Shuffle the order of "My Mix"?');
+    assert.match(asked.message, /permanently rearranges its 5 videos/);
+    assert.match(asked.message, /This is not shuffle play/);
+    assert.equal(asked.confirmLabel, 'Shuffle 5 videos');
+    api.cancel();
+    assert.equal((await pending).status, 'declined');
+    assert.equal(server.edits, 0);
+    assert.equal(backups('PLmix').length, 0);
+  });
+
+  it('clears a finished run\'s message when another playlist opens', async () => {
+    const server = createServer(ids(6));
+    const { api, navigate, lastView } = load(server, { href: MIX });
+    await api.run({ playlistId: 'PLmix' });
+    assert.equal(lastView().phase, 'done');
+    navigate('https://www.youtube.com/playlist?list=PLnext', 'Next - YouTube');
+    assert.equal(lastView().phase, 'idle');
+    assert.equal(lastView().status, '');
+    assert.equal(lastView().backups.length, 0);
+  });
+
+  it('offers retry only on the playlist that needs it', async () => {
+    const server = createServer(ids(8));
+    const { api, navigate, lastView } = load(server, { href: MIX });
+    server.onEdit = () => json({ status: 'STATUS_SUCCEEDED' });
+    await api.run({ playlistId: 'PLmix' });
+    assert.equal(lastView().canRetry, true);
+    navigate('https://www.youtube.com/playlist?list=PLnext', 'Next - YouTube');
+    assert.equal(lastView().canRetry, false);
   });
 });
