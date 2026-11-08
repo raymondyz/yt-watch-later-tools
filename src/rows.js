@@ -13,7 +13,7 @@
 // holds is read from its link on every check.
 (function (root) {
   const ns = root.__wlTools;
-  const { el, icon, createSheet, currentTheme, BASE_STYLES, EXTENSION_ICON, TOOLTIP } = ns.ui.kit;
+  const { el, icon, createSheet, adoptStyles, currentTheme, BASE_STYLES, EXTENSION_ICON, TOOLTIP } = ns.ui.kit;
 
   // YouTube's own element names, kept here so a redesign is a one-place fix.
   // `menu` is YouTube's menu, `menuButton` the ⋮ the buttons line up with,
@@ -137,8 +137,7 @@
     sheet ??= createSheet(STYLES);
     const host = el('div', { class: className });
     const shadow = host.attachShadow({ mode: 'open' });
-    if (sheet) shadow.adoptedStyleSheets = [sheet];
-    else shadow.append(el('style', { text: STYLES }));
+    adoptStyles(shadow, sheet, STYLES);
     return { host, shadow };
   }
 

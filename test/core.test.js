@@ -155,6 +155,29 @@ describe('assertSingleRemove', () => {
   });
 });
 
+describe('assertWatchLaterRemove', () => {
+  const remove = (videoId) => ({ action: 'ACTION_REMOVE_VIDEO_BY_VIDEO_ID', removedVideoId: videoId });
+
+  it('accepts one video out of Watch later, by its id', () => {
+    assert.doesNotThrow(() => core.assertWatchLaterRemove('WL', [remove('v')]));
+  });
+
+  it('refuses other playlists, where a video can be in twice, and anything else', () => {
+    const refused = [
+      ['PL1', [remove('v')]],
+      ['WL', [remove('v'), remove('w')]],
+      ['WL', [remove('')]],
+      ['WL', [{ ...remove('v'), setVideoId: 'a' }]],
+      ['WL', [{ action: 'ACTION_REMOVE_VIDEO', setVideoId: 'a' }]],
+      ['WL', []],
+      ['WL', null]
+    ];
+    for (const [playlistId, actions] of refused) {
+      assert.throws(() => core.assertWatchLaterRemove(playlistId, actions), /exactly one video from Watch later/);
+    }
+  });
+});
+
 describe('assertSingleAdd', () => {
   it('accepts exactly one video', () => {
     assert.doesNotThrow(() => core.assertSingleAdd([{ action: 'ACTION_ADD_VIDEO', addedVideoId: 'v' }]));
@@ -402,6 +425,23 @@ describe('buildRestoreTarget', () => {
     const target = core.buildRestoreTarget(current, ['b', 'b', 'gone', 'a']);
     assert.deepEqual(target, ['x', 'b', 'a']);
     assert.doesNotThrow(() => core.planMoves(current, target));
+  });
+});
+
+describe('videoIdFromHref', () => {
+  it('reads videos and Shorts, relative or absolute', () => {
+    assert.equal(core.videoIdFromHref('/watch?v=abc&list=RDx&start_radio=1'), 'abc');
+    assert.equal(core.videoIdFromHref('https://www.youtube.com/watch?v=xyz&t=10'), 'xyz');
+    assert.equal(core.videoIdFromHref('/shorts/s_h-1'), 's_h-1');
+  });
+
+  it('leaves out the skipped playlist, other sites, and links that are not videos', () => {
+    assert.equal(core.videoIdFromHref('/watch?v=abc&list=WL&index=2', 'WL'), null);
+    assert.equal(core.videoIdFromHref('/watch?v=abc&list=PL1', 'WL'), 'abc');
+    assert.equal(core.videoIdFromHref('https://music.youtube.com/watch?v=q'), null);
+    for (const href of ['/channel/UC1', '/watch?list=PL1', '', '/@someone', 'javascript:void(0)']) {
+      assert.equal(core.videoIdFromHref(href, 'WL'), null, href);
+    }
   });
 });
 

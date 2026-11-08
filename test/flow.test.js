@@ -46,7 +46,8 @@ function json(body, status = 200) {
     ok: status >= 200 && status < 300,
     status,
     json: async () => body,
-    text: async () => JSON.stringify(body)
+    text: async () => JSON.stringify(body),
+    clone: () => json(body, status)
   };
 }
 
@@ -92,6 +93,8 @@ function createServer(order) {
       for (const action of actions) {
         if (action.action === 'ACTION_REMOVE_VIDEO') {
           server.order = server.order.filter((id) => id !== action.setVideoId);
+        } else if (action.action === 'ACTION_REMOVE_VIDEO_BY_VIDEO_ID') {
+          server.order = server.order.filter((id) => server.videoIdOf(id) !== action.removedVideoId);
         } else if (action.action === 'ACTION_MOVE_VIDEO_BEFORE') {
           // With no successor named, the video goes to the bottom.
           server.order = [...server.order.filter((id) => id !== action.setVideoId), action.setVideoId];
@@ -145,7 +148,9 @@ function load(server, options = {}) {
     locks = null,
     storage = new Map(),
     frozenClock,
-    signedIn = true
+    signedIn = true,
+    // Also run watchlater.js, which reads Watch later in the background.
+    savedMarks = false
   } = options;
   if (Object.keys(config).length > 0) storage.set('wls:config', JSON.stringify(config));
   const views = [];
@@ -155,6 +160,7 @@ function load(server, options = {}) {
   const errors = [];
   let timers = 0;
   const unloadListeners = new Set();
+  const storageListeners = new Set();
   const documentListeners = new Map();
   const ytcfgData = { INNERTUBE_CONTEXT: { client: {} }, SESSION_INDEX: 0 };
   const url = new URL(href ?? 'https://www.youtube.com/');
@@ -195,6 +201,8 @@ function load(server, options = {}) {
     document: {
       cookie: signedIn ? 'SAPISID=abc; __Secure-1PAPISID=def; __Secure-3PAPISID=ghi' : 'PREF=f6=40000000',
       title: 'My Mix - YouTube',
+      visibilityState: 'visible',
+      hidden: false,
       addEventListener(type, listener) {
         documentListeners.set(type, [...(documentListeners.get(type) ?? []), listener]);
       },
@@ -202,6 +210,7 @@ function load(server, options = {}) {
     },
     addEventListener(type, listener) {
       if (type === 'beforeunload') unloadListeners.add(listener);
+      if (type === 'storage') storageListeners.add(listener);
     },
     removeEventListener(type, listener) {
       if (type === 'beforeunload') unloadListeners.delete(listener);
@@ -211,7 +220,7 @@ function load(server, options = {}) {
   const context = vm.createContext(sandbox);
   // Makes every Date.now() in the page return the same moment.
   if (frozenClock !== undefined) vm.runInContext(`Date.now = () => ${frozenClock};`, context);
-  for (const file of ['core.js', 'innertube.js']) {
+  for (const file of ['core.js', 'innertube.js', ...(savedMarks ? ['watchlater.js'] : [])]) {
     vm.runInContext(fs.readFileSync(path.join(SRC, file), 'utf8'), context);
   }
   // Stands in for ui.js and records everything main.js asks it to show.
@@ -244,6 +253,12 @@ function load(server, options = {}) {
     handlers: () => sandbox.__wlTools.ui.handlers,
     rowViews,
     rowHandlers: () => sandbox.__wlTools.rows.handlers,
+    // The page's fetch, as YouTube's own code calls it.
+    pageFetch: (input, init) => sandbox.fetch(input, init),
+    // Stands in for another tab writing to localStorage.
+    fireStorage: (key) => {
+      for (const listener of storageListeners) listener({ key });
+    },
     // Stands in for a YouTube navigation inside the single-page app.
     navigate(nextHref, title = 'My Mix - YouTube') {
       url.href = nextHref;
@@ -1430,6 +1445,258 @@ describe('move buttons', () => {
       }
       assert.deepEqual(sorted(server.order), sorted(ids(10)), `seed ${seed}`);
     }
+  });
+});
+
+describe('saved videos', () => {
+  const EDIT_URL = 'https://www.youtube.com/youtubei/v1/browse/edit_playlist?prettyPrint=false';
+  const NOW = Date.parse('2026-11-08T12:00:00.000Z');
+  const MINUTE = 60 * 1000;
+
+  // An edit sent the way YouTube's own buttons send one.
+  function youtubeEdit(env, playlistId, actions) {
+    return env.pageFetch(EDIT_URL, { method: 'POST', body: JSON.stringify({ context: {}, playlistId, actions }) });
+  }
+
+  function cached(entries, { account = '0/', savedAt = NOW } = {}) {
+    return new Map([['wls:saved', JSON.stringify({ version: 1, account, savedAt, entries })]]);
+  }
+
+  async function settle() {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+
+  it('reads Watch later once when signed in, and caches it for the account', async () => {
+    const server = createServer(ids(6));
+    const env = load(server, { savedMarks: true });
+    const saved = env.api.watchLater;
+    await waitFor(() => saved.size() === 6);
+    assert.equal(saved.has('v-s0'), true);
+    assert.equal(saved.has('v-other'), false);
+    assert.equal(server.reads, 2);
+    const cache = JSON.parse(env.storage.get('wls:saved'));
+    assert.equal(cache.account, '0/');
+    assert.deepEqual(cache.entries[0], ['s0', 'v-s0']);
+  });
+
+  it('sends nothing and marks nothing when signed out', async () => {
+    const server = createServer(ids(6));
+    const env = load(server, { savedMarks: true, signedIn: false, storage: cached([['s0', 'v-s0']]) });
+    await settle();
+    assert.equal(server.reads, 0);
+    assert.equal(env.api.watchLater.size(), 0);
+  });
+
+  it('uses a fresh cache without reading, and reads again once it is 15 minutes old', async () => {
+    const server = createServer(ids(6));
+    const fresh = load(server, { savedMarks: true, frozenClock: NOW, storage: cached([['x1', 'v-x1']], { savedAt: NOW - MINUTE }) });
+    await settle();
+    assert.equal(server.reads, 0);
+    assert.equal(fresh.api.watchLater.has('v-x1'), true);
+    const old = load(server, { savedMarks: true, frozenClock: NOW, storage: cached([['x1', 'v-x1']], { savedAt: NOW - 15 * MINUTE }) });
+    await waitFor(() => old.api.watchLater.size() === 6);
+    assert.equal(old.api.watchLater.has('v-x1'), false);
+  });
+
+  it('ignores a cache from another account', async () => {
+    const server = createServer(ids(6));
+    const env = load(server, { savedMarks: true, frozenClock: NOW, storage: cached([['x1', 'v-x1']], { account: '1/' }) });
+    await waitFor(() => env.api.watchLater.size() === 6);
+    assert.equal(env.api.watchLater.has('v-x1'), false);
+  });
+
+  it('follows saves and removals made with YouTube\'s own buttons', async () => {
+    const server = createServer(ids(6));
+    const env = load(server, { savedMarks: true });
+    const saved = env.api.watchLater;
+    await waitFor(() => saved.size() === 6);
+    let changes = 0;
+    saved.subscribe(() => {
+      changes += 1;
+    });
+    await youtubeEdit(env, 'WL', [{ action: 'ACTION_ADD_VIDEO', addedVideoId: 'v-new' }]);
+    await waitFor(() => saved.has('v-new'));
+    await youtubeEdit(env, 'WL', [{ action: 'ACTION_REMOVE_VIDEO_BY_VIDEO_ID', removedVideoId: 'v-new' }]);
+    await waitFor(() => !saved.has('v-new'));
+    await youtubeEdit(env, 'WL', [{ action: 'ACTION_REMOVE_VIDEO', setVideoId: 's2' }]);
+    await waitFor(() => !saved.has('v-s2'));
+    assert.equal(changes, 3);
+    assert.equal(server.reads, 2);
+    // Other tabs pick the change up from the cache.
+    assert.equal(JSON.parse(env.storage.get('wls:saved')).entries.some(([, id]) => id === 'v-s2'), false);
+  });
+
+  it('ignores moves, other playlists, and edits YouTube refused', async () => {
+    const server = createServer(ids(6));
+    const env = load(server, { savedMarks: true });
+    const saved = env.api.watchLater;
+    await waitFor(() => saved.size() === 6);
+    let changes = 0;
+    saved.subscribe(() => {
+      changes += 1;
+    });
+    await youtubeEdit(env, 'PLother', [{ action: 'ACTION_ADD_VIDEO', addedVideoId: 'v-elsewhere' }]);
+    await youtubeEdit(env, 'WL', [{ action: 'ACTION_MOVE_VIDEO_AFTER', setVideoId: 's3' }]);
+    server.onEdit = () => json({}, 400);
+    await youtubeEdit(env, 'WL', [{ action: 'ACTION_ADD_VIDEO', addedVideoId: 'v-refused' }]);
+    server.onEdit = () => json({ status: 'STATUS_FAILED' });
+    await youtubeEdit(env, 'WL', [{ action: 'ACTION_REMOVE_VIDEO', setVideoId: 's1' }]);
+    await settle();
+    assert.equal(changes, 0);
+    assert.equal(saved.has('v-elsewhere'), false);
+    assert.equal(saved.has('v-refused'), false);
+    assert.equal(saved.has('v-s1'), true);
+  });
+
+  it('follows the extension\'s own Remove button and Undo', async () => {
+    const server = createServer(ids(6));
+    const env = load(server, { savedMarks: true, href: WL_PAGE });
+    const saved = env.api.watchLater;
+    await waitFor(() => saved.size() === 6 && env.rowViews.at(-1)?.removable === true);
+    const rows = env.rowHandlers();
+    await rows.onRemove({ playlistId: 'WL', videoId: 'v-s4' });
+    await waitFor(() => !saved.has('v-s4'));
+    await rows.onUndo({ playlistId: 'WL', videoId: 'v-s4', afterVideoId: 'v-s3' });
+    await waitFor(() => saved.has('v-s4'));
+  });
+
+  it('reads again when a removal names an entry it does not know', async () => {
+    const server = createServer(ids(6));
+    const env = load(server, { savedMarks: true });
+    await waitFor(() => env.api.watchLater.size() === 6);
+    const reads = server.reads;
+    await youtubeEdit(env, 'WL', [{ action: 'ACTION_REMOVE_VIDEO', setVideoId: 'not-known' }]);
+    await waitFor(() => server.reads === reads + 2);
+  });
+
+  it('lets one tab read for all of them', async () => {
+    const server = createServer(ids(6));
+    const storage = new Map();
+    const locks = createLocks();
+    const first = load(server, { savedMarks: true, storage, locks });
+    const second = load(server, { savedMarks: true, storage, locks });
+    await waitFor(() => first.api.watchLater.size() === 6);
+    second.fireStorage('wls:saved');
+    assert.equal(second.api.watchLater.size(), 6);
+    assert.equal(server.reads, 2);
+    // An edit seen in one tab reaches the other through the cache.
+    await youtubeEdit(first, 'WL', [{ action: 'ACTION_ADD_VIDEO', addedVideoId: 'v-new' }]);
+    await waitFor(() => first.api.watchLater.has('v-new'));
+    second.fireStorage('wls:saved');
+    assert.equal(second.api.watchLater.has('v-new'), true);
+  });
+
+  it('passes YouTube\'s own requests through untouched', async () => {
+    const server = createServer(ids(6));
+    const env = load(server, { savedMarks: true });
+    await waitFor(() => env.api.watchLater.size() === 6);
+    const answer = json({ status: 'STATUS_SUCCEEDED' });
+    server.onEdit = () => answer;
+    assert.equal(await youtubeEdit(env, 'WL', [{ action: 'ACTION_ADD_VIDEO', addedVideoId: 'v-x' }]), answer);
+    const failure = new TypeError('Failed to fetch');
+    server.onRead = () => {
+      throw failure;
+    };
+    await assert.rejects(env.pageFetch('https://www.youtube.com/youtubei/v1/browse', { method: 'POST', body: '{}' }), (err) => err === failure);
+    // A request YouTube's server fails reaches YouTube's code unchanged.
+    await assert.rejects(env.pageFetch(EDIT_URL, { method: 'POST', body: 'not json' }), /not valid JSON/);
+    assert.deepEqual(env.errors, []);
+  });
+
+  it('keeps Watch later\'s order through moves, so it knows where each video sits', async () => {
+    const server = createServer(ids(6));
+    const env = load(server, { savedMarks: true });
+    const saved = env.api.watchLater;
+    await waitFor(() => saved.size() === 6);
+    assert.equal(saved.placeOf('v-s0'), null);
+    assert.equal(saved.placeOf('v-s3'), 's2');
+    await youtubeEdit(env, 'WL', [{ action: 'ACTION_MOVE_VIDEO_AFTER', setVideoId: 's3' }]);
+    await waitFor(() => saved.placeOf('v-s3') === null);
+    assert.equal(saved.placeOf('v-s0'), 's3');
+    await youtubeEdit(env, 'WL', [{ action: 'ACTION_MOVE_VIDEO_BEFORE', setVideoId: 's0' }]);
+    await waitFor(() => saved.placeOf('v-s0') === 's5');
+    assert.equal(saved.placeOf('v-unknown'), undefined);
+    // An entry YouTube didn't name can't be the place to put a video back.
+    server.onEdit = (_, body) => {
+      server.apply(body.actions);
+      return json({ status: 'STATUS_SUCCEEDED' });
+    };
+    await youtubeEdit(env, 'WL', [{ action: 'ACTION_ADD_VIDEO', addedVideoId: 'v-unnamed' }]);
+    await waitFor(() => saved.has('v-unnamed'));
+    server.onEdit = () => undefined;
+    await youtubeEdit(env, 'WL', [{ action: 'ACTION_MOVE_VIDEO_BEFORE', setVideoId: 's1' }]);
+    // Order now: s3, s2, s4, s5, s0, the unnamed entry, s1.
+    await waitFor(() => saved.placeOf('v-s1') !== 's3');
+    assert.equal(saved.placeOf('v-s1'), undefined);
+    // A move naming that entry by its real id can't be placed, so the list
+    // reads Watch later again, and then has every place right.
+    const reads = server.reads;
+    await youtubeEdit(env, 'WL', [{ action: 'ACTION_MOVE_VIDEO_AFTER', setVideoId: 's2', movedSetVideoIdPredecessor: 'added-1' }]);
+    await waitFor(() => server.reads > reads && saved.placeOf('v-s2') === 'added-1');
+    const order = server.order;
+    assert.ok(order.every((id, i) => saved.placeOf(server.videoIdOf(id)) === (i === 0 ? null : order[i - 1])));
+  });
+
+  it('follows a shuffle without reading again when it knows every entry', async () => {
+    const server = createServer(ids(9));
+    const env = load(server, { savedMarks: true });
+    const saved = env.api.watchLater;
+    await waitFor(() => saved.size() === 9);
+    const result = await env.api.run();
+    assert.equal(result.status, 'done');
+    await settle();
+    const order = server.order;
+    assert.ok(order.every((id, i) => saved.placeOf(`v-${id}`) === (i === 0 ? null : order[i - 1])));
+    // Its own read before the shuffle, the shuffle's read and its check.
+    assert.equal(server.reads, 3 + 3 + 1);
+  });
+
+  it('the thumbnail button removes a saved video, and saving it again puts it back in place', async () => {
+    const server = createServer(ids(6));
+    const env = load(server, { savedMarks: true });
+    const saved = env.api.watchLater;
+    await waitFor(() => saved.size() === 6);
+    const sent = [];
+    server.onEdit = (_, body) => {
+      sent.push(JSON.parse(JSON.stringify(body)));
+    };
+    await env.api.removeFromWatchLater('v-s3');
+    assert.deepEqual(sent[0].actions, [{ action: 'ACTION_REMOVE_VIDEO_BY_VIDEO_ID', removedVideoId: 'v-s3' }]);
+    assert.equal(sent[0].playlistId, 'WL');
+    assert.equal(server.order.length, 5);
+    await waitFor(() => !saved.has('v-s3'));
+    await env.api.saveToWatchLater('v-s3');
+    assert.deepEqual(server.order.map(server.videoIdOf), ids(6).map((id) => `v-${id}`));
+    await waitFor(() => saved.has('v-s3'));
+    // The first video goes back to the top.
+    await env.api.removeFromWatchLater('v-s0');
+    await env.api.saveToWatchLater('v-s0');
+    assert.equal(server.videoIdOf(server.order[0]), 'v-s0');
+    // A video saved for the first time just goes where YouTube puts it.
+    const before = sent.length;
+    await env.api.saveToWatchLater('v-fresh');
+    assert.deepEqual(sent.slice(before).map((body) => body.actions[0].action), ['ACTION_ADD_VIDEO']);
+    assert.deepEqual(env.errors, []);
+  });
+
+  it('refuses to remove from Watch later anything but one video by its id', async () => {
+    const server = createServer(ids(3));
+    const env = load(server, { savedMarks: true });
+    for (const bad of ['', null, undefined, 42]) {
+      await assert.rejects(env.api.innertube.removeFromWatchLater(bad), /exactly one video from Watch later/);
+    }
+    assert.equal(server.edits, 0);
+  });
+
+  it('still shuffles normally with the edits being followed', async () => {
+    const server = createServer(ids(12));
+    const env = load(server, { savedMarks: true });
+    await waitFor(() => env.api.watchLater.size() === 12);
+    const result = await env.api.run();
+    assert.equal(result.status, 'done');
+    assert.deepEqual(server.order, targetIds(result));
+    assert.equal(env.api.watchLater.size(), 12);
+    assert.deepEqual(env.errors, []);
   });
 });
 

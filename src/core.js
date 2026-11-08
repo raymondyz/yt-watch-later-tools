@@ -9,6 +9,7 @@
     browsePath: 'browse',
     editPlaylistPath: 'browse/edit_playlist',
     browseIdPrefix: 'VL',
+    watchLaterId: 'WL',
 
     contextKey: 'INNERTUBE_CONTEXT',
     sessionIndexKey: 'SESSION_INDEX',
@@ -27,6 +28,8 @@
     // YouTube Music's client does. The web client never sends it.
     moveBeforeAction: 'ACTION_MOVE_VIDEO_BEFORE',
     removeAction: 'ACTION_REMOVE_VIDEO',
+    removeByVideoIdAction: 'ACTION_REMOVE_VIDEO_BY_VIDEO_ID',
+    removedVideoField: 'removedVideoId',
     addAction: 'ACTION_ADD_VIDEO',
     addedVideoField: 'addedVideoId',
     addedResult: 'playlistEditVideoAddedResultData',
@@ -124,6 +127,20 @@
       && typeof action.setVideoId === 'string'
       && action.setVideoId !== '';
     if (!safe) throw new Error('Refused to send a removal that is not exactly one video.');
+  }
+
+  // The thumbnail button's removal: one video out of Watch later, by its
+  // video id, the way YouTube's own "Remove from Watch later" does it. Watch
+  // later holds each video once, so this can only take that one video, and
+  // it is refused for any other playlist, where a video can appear twice.
+  function assertWatchLaterRemove(playlistId, actions) {
+    const action = Array.isArray(actions) && actions.length === 1 ? actions[0] : null;
+    const safe = playlistId === INNERTUBE.watchLaterId
+      && action?.action === INNERTUBE.removeByVideoIdAction
+      && Object.keys(action).length === 2
+      && typeof action[INNERTUBE.removedVideoField] === 'string'
+      && action[INNERTUBE.removedVideoField] !== '';
+    if (!safe) throw new Error('Refused to send a removal that is not exactly one video from Watch later.');
   }
 
   // Undo's request: adds exactly one video back.
@@ -295,6 +312,23 @@
     ];
   }
 
+  // The video a link on YouTube plays: /watch?v=ID or /shorts/ID, or null.
+  // A link into `skipList` gives null, so that list's own rows are left out.
+  function videoIdFromHref(href, skipList = null) {
+    let url;
+    try {
+      url = new URL(href, INNERTUBE.origin);
+    } catch (err) {
+      return null;
+    }
+    if (url.origin !== INNERTUBE.origin) return null;
+    if (url.pathname === '/watch') {
+      if (skipList !== null && url.searchParams.get('list') === skipList) return null;
+      return url.searchParams.get('v') || null;
+    }
+    return url.pathname.match(/^\/shorts\/([\w-]+)/)?.[1] ?? null;
+  }
+
   function countOutOfPlace(current, target) {
     return target.filter((id, i) => current[i] !== id).length;
   }
@@ -315,6 +349,7 @@
     planMoves,
     assertMoveOnly,
     assertSingleRemove,
+    assertWatchLaterRemove,
     assertSingleAdd,
     readAddedSetVideoId,
     keepBackups,
@@ -323,6 +358,7 @@
     parseDisplayedCount,
     isEditSuccess,
     buildRestoreTarget,
+    videoIdFromHref,
     countOutOfPlace,
     validateBackup
   };

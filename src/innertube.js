@@ -142,6 +142,11 @@
       .join('');
   }
 
+  // Signed in to YouTube, as far as the cookies the auth header needs say.
+  function isSignedIn() {
+    return [IT.sapisidCookie, IT.sapisid1pCookie, IT.sapisid3pCookie].some((name) => readCookie(name) !== null);
+  }
+
   async function buildAuthHeader() {
     const ts = Math.floor(Date.now() / 1000);
     // YouTube's client also signs USER_SESSION_ID when the page has one, and
@@ -316,6 +321,18 @@
     if (!core.isEditSuccess(json)) throw new EditRejectedError('YouTube did not confirm the removal.');
   }
 
+  // The thumbnail button's removal from Watch later. Retrying is safe: a
+  // second try can only find the video already gone.
+  async function removeFromWatchLater(videoId, { signal } = {}) {
+    const actions = [{ action: IT.removeByVideoIdAction, [IT.removedVideoField]: videoId }];
+    core.assertWatchLaterRemove(IT.watchLaterId, actions);
+    const json = await withRetries(
+      () => innertubePost(IT.editPlaylistPath, { playlistId: IT.watchLaterId, actions }, signal),
+      { signal }
+    );
+    if (!core.isEditSuccess(json)) throw new EditRejectedError('YouTube did not confirm the removal.');
+  }
+
   // Undo's request. Sent once: if an answer is lost, a retry could add the
   // video twice. Returns the new entry's setVideoId, or null if not given.
   async function addToPlaylist(playlistId, videoId, { signal } = {}) {
@@ -325,8 +342,67 @@
       () => innertubePost(IT.editPlaylistPath, { playlistId, actions }, signal),
       { signal, retryTransient: false }
     );
-    if (!core.isEditSuccess(json)) throw new EditRejectedError('YouTube did not confirm adding the video back.');
+    if (!core.isEditSuccess(json)) throw new EditRejectedError('YouTube did not confirm adding the video.');
     return core.readAddedSetVideoId(json, videoId);
+  }
+
+  // Calls every listener after each playlist edit YouTube confirms, whoever
+  // sent it: YouTube's own buttons or this extension. It works by wrapping
+  // the page's fetch, which YouTube calls for every request. The wrapper only
+  // reads requests and answers as they pass, never changes them, and anything
+  // that goes wrong in it is swallowed so YouTube's request is unaffected.
+  const editListeners = new Set();
+  let observing = false;
+
+  function requestUrl(input) {
+    if (typeof input === 'string') return input;
+    return input instanceof URL ? input.href : String(input?.url ?? '');
+  }
+
+  // Called before fetch sends, while a Request's body can still be copied.
+  function readEditBody(input, init) {
+    if (!requestUrl(input).includes(`${IT.apiBase}${IT.editPlaylistPath}`)) return null;
+    if (typeof init?.body === 'string') return Promise.resolve(init.body);
+    if (typeof Request !== 'undefined' && input instanceof Request) return input.clone().text().catch(() => null);
+    return null;
+  }
+
+  async function reportEdit(bodyText, response) {
+    if (!response?.ok) return;
+    const [body, json] = await Promise.all([bodyText, response.clone().json()]);
+    if (typeof body !== 'string' || !core.isEditSuccess(json)) return;
+    const { playlistId, actions } = JSON.parse(body);
+    if (typeof playlistId !== 'string' || !Array.isArray(actions)) return;
+    for (const listener of editListeners) listener({ playlistId, actions, response: json });
+  }
+
+  function observeEdits(listener) {
+    editListeners.add(listener);
+    if (!observing && typeof root.fetch === 'function') {
+      observing = true;
+      const original = root.fetch;
+      root.fetch = function (input, init) {
+        let bodyText = null;
+        try {
+          bodyText = readEditBody(input, init);
+        } catch (err) {
+          bodyText = null;
+        }
+        const result = original.apply(root, arguments);
+        if (bodyText) {
+          result.then(
+            (response) => reportEdit(bodyText, response).catch((err) => log('Could not read a playlist edit.', err)),
+            () => {}
+          );
+        }
+        return result;
+      };
+    }
+    return () => editListeners.delete(listener);
+  }
+
+  function log(...args) {
+    if (CONFIG.debug) console.log('[wlt]', ...args);
   }
 
   ns.innertube = {
@@ -338,10 +414,13 @@
     sleep,
     requestGap,
     readSession,
+    isSignedIn,
+    observeEdits,
     withRetries,
     readPlaylist,
     editPlaylist,
     removeFromPlaylist,
+    removeFromWatchLater,
     addToPlaylist
   };
 })(globalThis);

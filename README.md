@@ -7,6 +7,8 @@ Tools so far:
 - **Shuffle order:** permanently rearranges a playlist into a random order. The new order is stored on YouTube, so it shows on every device. This is not YouTube's own Shuffle button, which plays a playlist in random order once and leaves the playlist unchanged.
 - **Backups:** the current order is saved before every change, and any saved order can be restored.
 - **Row buttons:** purple buttons on every video of a playlist you can edit: **move to top** and **move to bottom**, stacked, and **remove**, each one click instead of going through YouTube's ⋮ menu. Moved videos jump to their new place on the page, with no reload. The remove button is also in the playlist panel beside a playing video, and a removal can be undone.
+- **Saved marks:** a purple clock on the thumbnail of every video that's in your Watch later, everywhere YouTube shows one, so you can tell at a glance what you've already saved.
+- **Save button on hover:** point at a thumbnail, and a button in its corner saves the video to Watch later, or removes it if it's already there.
 
 ## Install
 
@@ -37,6 +39,26 @@ The remove button is also in the playlist panel beside a video playing from the 
 
 The buttons appear once the extension has read the first page of the playlist, which takes about a third of a second. They don't appear on playlists you can't edit, or when you're signed out.
 
+### Marks on saved videos
+
+Every thumbnail of a video in your Watch later gets a purple circle with a clock in its top left corner. On big thumbnails, such as the home page's and search results, it's the size of YouTube's own buttons on a playing preview (40 px, 8 px in from the corner); on small ones, such as the recommendations beside a video, it's 24 px. This covers home, subscriptions, search, channel pages, the recommendations beside a playing video, other playlists, Shorts, and the suggestions inside the player at the end of a video. Watch later's own rows don't get one, and neither do mixes or playlists. The mark lets clicks and hover previews through, as if it weren't there.
+
+- **Saving or removing a video in this tab** updates the marks at once, whether you used YouTube's own buttons or this extension's.
+- **Changes from another device** show within 15 minutes: the extension reads your Watch later again in the background when its copy is that old, about a third of a second per 100 videos. Background tabs wait until you look at them.
+- **All your YouTube tabs share one copy,** kept in youtube.com's storage and tied to the signed-in account. One tab reads; the others pick up its result.
+- **Signed out,** there are no marks and no requests.
+
+### Saving and removing from a thumbnail
+
+Point at a thumbnail, and a round button appears in its top left corner, the same size and height as YouTube's own mute and captions buttons on a playing preview. Clicking it never opens the video.
+
+- **Not saved yet:** the button is dark with a clock and a plus. Click it to save the video: it turns purple with a check, and the saved mark takes its place once you move away.
+- **Already saved:** the button sits exactly over the purple mark and looks like it, until you point at it, when it shows a cross. Click it to remove the video from Watch later. The button turns back to saving, and clicking it again puts the video back in the place it was removed from, so a slip costs nothing.
+
+It works on the same thumbnails as the marks, stays on top when YouTube starts playing a preview, and doesn't stop the preview. It doesn't appear on Watch later's own rows, or on thumbnails that already show YouTube's own Watch later button on hover, such as some channel pages, so a thumbnail never gets two. If YouTube refuses, the button turns red and its tooltip says why. A save is sent only once, so a lost answer can't save a video twice. A removal names just that one video, which Watch later holds only once.
+
+To change how the mark or the save button looks, edit `src/indicator.js`. It's the only file that decides their look: icons, colors, sizes and corner.
+
 The button lives in YouTube's header while you are on a playlist. If you browse elsewhere during a run, or YouTube's header can't be found, a floating button at the bottom right takes its place, so progress and **Stop** are always one click away.
 
 ## Safety
@@ -45,7 +67,9 @@ Losing a video is treated as unacceptable, and losing the order as something to 
 
 - **Shuffles and restores can't remove videos.** They only ever send "move this video after that one". A check runs right before every request and refuses anything else, so no bug or setting can make a shuffle or restore remove a video. Stopping, closing the tab, a crash or a network failure at any point leaves every video in the playlist.
 - **The move buttons only move.** They go through the same move-only check as shuffles.
+- **The thumbnail button removes only from Watch later, one video at a time.** It sends the same request as YouTube's own "Remove from Watch later", which names the video, and a check refuses it for any other playlist, where a video can be in twice.
 - **The Remove button removes exactly one video: the one you clicked.** The row only supplies its video's ID, from its own link. The playlist entry to remove comes from the extension's own read of the playlist, and a check refuses any request that names more than one entry. If a video is in a playlist twice, the button refuses rather than guess which copy you meant. Undo is sent only once, so a lost answer can't add the video twice.
+- **Following YouTube's own saves only reads.** To see saves made with YouTube's buttons, the extension wraps the page's `fetch` and looks at playlist edits as they pass. It never changes a request or an answer, and anything that goes wrong in it is ignored, so YouTube's own request carries on as if the wrapper weren't there.
 - **Nothing changes without a backup.** The current order is saved and read back before the first move. If that fails, the shuffle doesn't start.
 - **The original order is never rotated out.** When there are more backups than `backupsToKeep`, the middle ones go and the oldest stays.
 - **One shuffle at a time, across all tabs.** While one YouTube tab is shuffling or restoring, or waiting for you to confirm, the others say **Busy in another tab** and can't start.
@@ -64,7 +88,7 @@ Run the automated tests:
 node --test test/
 ```
 
-`test/core.test.js` covers the pure logic. `test/flow.test.js` runs the real `innertube.js` and `main.js` against a simulated YouTube backend, covering retries, pause and resume, stop, verify and repair, restore, the panel's wiring, and the row buttons' requests and Undo. It also covers the safety cases: several tabs, closed tabs, requests that never answer, repeated clicks and bad settings. One randomized test throws failures at runs and checks that no video is ever lost; run `CHAOS_SEEDS=1000 node --test test/` for a longer search. `ui.js` and `rows.js` need a real page, so check them by hand: the button should appear under **Play all** in both the wide sidebar header and the narrow top header, and each video should have the stacked move buttons and a trash button just left of its ⋮ menu.
+`test/core.test.js` covers the pure logic. `test/flow.test.js` runs the real `innertube.js` and `main.js` against a simulated YouTube backend, covering retries, pause and resume, stop, verify and repair, restore, the panel's wiring, the row buttons' requests and Undo, and the list of saved videos behind the thumbnail marks. It also covers the safety cases: several tabs, closed tabs, requests that never answer, repeated clicks and bad settings. One randomized test throws failures at runs and checks that no video is ever lost; run `CHAOS_SEEDS=1000 node --test test/` for a longer search. `ui.js` and `rows.js` need a real page, so check them by hand: the button should appear under **Play all** in both the wide sidebar header and the narrow top header, and each video should have the stacked move buttons and a trash button just left of its ⋮ menu.
 
 After changing anything that talks to YouTube, repeat these manual tests, signed in, on a throwaway playlist of about 10 videos before using Watch Later:
 
@@ -111,6 +135,8 @@ Checked on 2026-11-06 against client version `2.20261030.02.00`, without signing
 | MAIN world injection, `ytcfg`, Trusted Types | Confirmed in Chromium | Loaded on live youtube.com, signed out. |
 | Panel: shuffle, restore, stop, themes, navigation | Confirmed in Chromium | Driven on a live youtube.com playlist page with the playlist requests answered by a mock, on 2026-11-07. |
 | Moving rows on the page | Confirmed in Chromium | After a move, the row's element is moved within YouTube's list. YouTube then still loaded the rest of a 182-video playlist correctly, on 2026-11-07. |
+| Save button on hover | Confirmed in Chromium, **not yet signed in** | Driven with real mouse input on live search, watch and channel pages, with Watch later answered by a mock, on 2026-11-08: it appears in the right corner, stays on top of YouTube's playing preview without ending it, saves exactly the pointed-at video with one request and no navigation (Shorts too), shows a refusal, and stays away from saved videos and from thumbnails with YouTube's own Watch later button. |
+| Marks on saved videos | Confirmed in Chromium, **not yet signed in** | Driven on live search, watch, channel and playlist pages with Watch later answered by a mock, on 2026-11-08: the right thumbnails marked in every list, Shorts and the in-player suggestions included, mixes left out, and marks following saves and removals sent the way YouTube's buttons send them, in the same tab and in another. YouTube's own requests go through `window.fetch` even when it is wrapped after the page loads, which is what lets the extension see your saves. |
 | Move to bottom | **Not yet confirmed** | YouTube's web client has no request for it. The button first sends `ACTION_MOVE_VIDEO_BEFORE` with no successor named, which is how YouTube Music's client moves a video to the end. If YouTube refuses that, it reads the whole playlist and moves the video after the last one, and keeps doing that until the page reloads. Both paths pass in Chromium against a mock. |
 | Remove and add actions | Confirmed in client code | `ACTION_REMOVE_VIDEO` with `setVideoId`, and `ACTION_ADD_VIDEO` with `addedVideoId`. An add's answer names the new entry in `playlistEditResults[].playlistEditVideoAddedResultData`. |
 | Remove button and Undo | Confirmed in Chromium, **not yet signed in** | Driven on a live public playlist page and its watch page with the playlist requests answered by a mock, on 2026-11-07: placement and centering on the ⋮ in both window widths, the watch page panel (`ytd-playlist-panel-video-renderer`, shown on hover), one request per click, undo back to the same place, failure messages, dark theme. Signed out, YouTube draws playlist page rows as `yt-lockup-view-model`. Your own playlists may still use `ytd-playlist-video-renderer`, which is supported but has only been checked in code. |
@@ -122,6 +148,7 @@ Checked on 2026-11-06 against client version `2.20261030.02.00`, without signing
 - If a response shape changes, adjust the parser in `src/core.js`, then add the new shape to `test/core.test.js`.
 - Files in `fixtures/` are picked up by the tests automatically: `initial_data.json` and `browse_continuation.response.json`.
 - The header button is placed after YouTube's visible action row, found by the selectors in the `YOUTUBE_DOM` block at the top of `src/ui.js`. If a redesign breaks them, the floating button appears instead after 3 seconds, so everything keeps working until the selector is updated.
+- The marks and the save button find thumbnails with the selectors in the `YOUTUBE_THUMBNAILS` block at the top of `src/thumbnails.js`. If YouTube adds a new kind of thumbnail, add its element there. The same file names YouTube's hover preview (`PREVIEW`) and its own Watch later hover button (`OWN_SAVE_BUTTON`).
 - The Remove buttons find rows and YouTube's ⋮ menu with the selectors in the `YOUTUBE_ROWS` block at the top of `src/rows.js`, one entry per kind of row. Each button is lined up with the ⋮ by measuring both, so a layout change moves it along. If a redesign breaks the selectors, the buttons simply don't appear; nothing else is affected.
 - Storage keys and the `wls:config` setting keep the extension's original `wls` prefix, so backups and settings saved before the rename to Watch Later Tools stay readable. Don't rename them without migrating.
 
@@ -152,6 +179,8 @@ Everything the panel does is also available as `__wlTools` on any youtube.com pa
 | Function | Purpose |
 | --- | --- |
 | `fetchPlaylist(playlistId = 'WL')` | Returns the full item list |
+| `saveToWatchLater(videoId)` | Saves a video, as the thumbnail button does |
+| `removeFromWatchLater(videoId)` | Removes a video from Watch later, as the thumbnail button does |
 | `run({ playlistId = 'WL' } = {})` | Full shuffle: confirm, backup, move, verify |
 | `restore({ playlistId = 'WL' } = {})` | Restores the latest saved backup |
 | `restoreFromBackup(backupObject)` | Restores from a backup object, such as an older saved backup |

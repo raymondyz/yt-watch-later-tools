@@ -255,6 +255,13 @@
     }
   }
 
+  // Gives a shadow root its styles: the shared sheet when the browser could
+  // build one, a <style> element otherwise.
+  function adoptStyles(shadow, sheet, text) {
+    if (sheet) shadow.adoptedStyleSheets = [sheet];
+    else shadow.append(el('style', { text }));
+  }
+
   function currentTheme() {
     return document.documentElement.hasAttribute('dark') ? 'dark' : 'light';
   }
@@ -262,8 +269,7 @@
   function createHost(id, sheet) {
     const host = el('div', { id });
     const shadow = host.attachShadow({ mode: 'open' });
-    if (sheet) shadow.adoptedStyleSheets = [sheet];
-    else shadow.append(el('style', { text: STYLES }));
+    adoptStyles(shadow, sheet, STYLES);
     const wrap = el('div', { class: 'wlt' });
     shadow.append(wrap);
     return { host, wrap };
@@ -722,6 +728,6 @@
     render,
     confirm,
     // For other parts of the extension's UI, so they look the same.
-    kit: { el, icon, createSheet, currentTheme, BASE_STYLES, EXTENSION_ICON, TOOLTIP }
+    kit: { el, icon, createSheet, adoptStyles, currentTheme, BASE_STYLES, EXTENSION_ICON, TOOLTIP }
   };
 })(globalThis);

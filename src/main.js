@@ -1,5 +1,5 @@
-// Wiring: runs, cancel, restore, the Remove buttons, navigation detection, and
-// the console API.
+// Wiring: runs, cancel, restore, the row buttons, the marks and save button
+// on thumbnails, navigation detection, and the console API.
 //
 // Safety rules this file keeps:
 // - Shuffles and restores only ever send moves (checked in
@@ -788,6 +788,46 @@
     }
   }
 
+  // The button on thumbnails saves a video, or removes a saved one. A removal
+  // remembers where the video was, so saving it again from a thumbnail puts
+  // it back in that place: a slip costs nothing. videoId -> the setVideoId of
+  // the entry before it, or null when it was first.
+  const removedFromThumbnail = new Map();
+
+  // Sent once, like Undo, so a lost answer can't save a video twice. The
+  // marks follow through the edit watcher.
+  async function saveToWatchLater(videoId) {
+    let setVideoId;
+    try {
+      setVideoId = await it.addToPlaylist(WATCH_LATER, videoId);
+      log(`Saved ${videoId} to Watch later.`);
+    } catch (err) {
+      throw rowError(err, 'Not saved.');
+    }
+    const after = removedFromThumbnail.get(videoId);
+    removedFromThumbnail.delete(videoId);
+    if (after === undefined || !setVideoId) return;
+    const actions = [core.toAction({ setVideoId, after })];
+    const known = new Set([setVideoId, after].filter(Boolean));
+    try {
+      await it.withRetries(() => it.editPlaylist(WATCH_LATER, actions, { known }));
+      log(`Put ${videoId} back where it was.`);
+    } catch (err) {
+      log('Saved, but could not put it back where it was.', err);
+    }
+  }
+
+  async function removeFromWatchLater(videoId) {
+    const after = ns.watchLater?.placeOf(videoId);
+    try {
+      await it.removeFromWatchLater(videoId);
+      log(`Removed ${videoId} from Watch later.`);
+    } catch (err) {
+      throw rowError(err, 'Not removed.');
+    }
+    if (after !== undefined) removedFromThumbnail.set(videoId, after);
+  }
+
   // The playlist whose videos this page lists: a playlist page, or a video
   // playing from a playlist, with the playlist in the panel beside it. Mixes
   // and the queue can't be edited, so they are skipped without a request.
@@ -879,6 +919,8 @@
 
   Object.assign(ns, {
     fetchPlaylist,
+    saveToWatchLater,
+    removeFromWatchLater,
     run,
     restore,
     restoreFromBackup,
@@ -905,6 +947,23 @@
     onUndo: undoRemove,
     onMove: moveVideo
   });
+
+  // On thumbnails everywhere but Watch later itself: a mark on saved videos,
+  // and a button to save the one under the pointer.
+  ns.watchLater?.start();
+  const { watchLater, thumbnails, indicator } = ns;
+  if (watchLater && thumbnails && indicator) {
+    ns.badges?.mount({ saved: watchLater, thumbnails, createMark: indicator.createMark, skipList: WATCH_LATER });
+    ns.quickSave?.mount({
+      saved: watchLater,
+      thumbnails,
+      createButton: indicator.createSaveButton,
+      canSave: it.isSignedIn,
+      save: saveToWatchLater,
+      remove: removeFromWatchLater,
+      skipList: WATCH_LATER
+    });
+  }
 
   watchPage();
   refreshView();
