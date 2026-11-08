@@ -23,6 +23,13 @@
 
     moveAfterAction: 'ACTION_MOVE_VIDEO_AFTER',
     predecessorField: 'movedSetVideoIdPredecessor',
+    // Sent with no successor only, which moves a video to the bottom, as
+    // YouTube Music's client does. The web client never sends it.
+    moveBeforeAction: 'ACTION_MOVE_VIDEO_BEFORE',
+    removeAction: 'ACTION_REMOVE_VIDEO',
+    addAction: 'ACTION_ADD_VIDEO',
+    addedVideoField: 'addedVideoId',
+    addedResult: 'playlistEditVideoAddedResultData',
     successStatus: 'STATUS_SUCCEEDED',
 
     videoRenderer: 'playlistVideoRenderer',
@@ -88,13 +95,17 @@
     return moves;
   }
 
-  // The extension only ever moves videos, and a move cannot remove one. This
-  // refuses anything else before it is sent, so no code path can delete a
-  // video. When `known` is given, every id an action mentions must be in it.
+  // Shuffles, restores and the move buttons only ever move videos, and a move
+  // cannot remove one. This refuses anything else before it is sent, so none
+  // of them can delete a video. When `known` is given, every id an action
+  // mentions must be in it. A move to the bottom names no other video.
   function assertMoveOnly(actions, known = null) {
     const fields = new Set(['action', 'setVideoId', INNERTUBE.predecessorField]);
     const isKnown = (id) => typeof id === 'string' && (known === null || known.has(id));
     const safe = Array.isArray(actions) && actions.length > 0 && actions.every((action) => {
+      if (action?.action === INNERTUBE.moveBeforeAction) {
+        return Object.keys(action).length === 2 && isKnown(action.setVideoId);
+      }
       const after = action?.[INNERTUBE.predecessorField];
       return action?.action === INNERTUBE.moveAfterAction
         && Object.keys(action).every((key) => fields.has(key))
@@ -102,6 +113,39 @@
         && (after === undefined || (isKnown(after) && after !== action.setVideoId));
     });
     if (!safe) throw new Error('Refused to send a playlist edit that is not a plain move.');
+  }
+
+  // The Remove button's request: exactly one entry, picked by its setVideoId,
+  // which belongs to that one entry alone, so it cannot take any other video.
+  function assertSingleRemove(actions) {
+    const action = Array.isArray(actions) && actions.length === 1 ? actions[0] : null;
+    const safe = action?.action === INNERTUBE.removeAction
+      && Object.keys(action).length === 2
+      && typeof action.setVideoId === 'string'
+      && action.setVideoId !== '';
+    if (!safe) throw new Error('Refused to send a removal that is not exactly one video.');
+  }
+
+  // Undo's request: adds exactly one video back.
+  function assertSingleAdd(actions) {
+    const action = Array.isArray(actions) && actions.length === 1 ? actions[0] : null;
+    const safe = action?.action === INNERTUBE.addAction
+      && Object.keys(action).length === 2
+      && typeof action[INNERTUBE.addedVideoField] === 'string'
+      && action[INNERTUBE.addedVideoField] !== '';
+    if (!safe) throw new Error('Refused to send an addition that is not exactly one video.');
+  }
+
+  // The new entry's setVideoId from an add's response, or null when the
+  // response doesn't say.
+  function readAddedSetVideoId(json, videoId) {
+    let found = null;
+    walk(json, (node) => {
+      const result = node[INNERTUBE.addedResult];
+      if (found !== null || typeof result?.setVideoId !== 'string') return;
+      if (result.videoId === undefined || result.videoId === videoId) found = result.setVideoId;
+    });
+    return found;
   }
 
   // Backups are newest first. Past the limit the middle ones go, because the
@@ -260,7 +304,7 @@
       && typeof backup.playlistId === 'string'
       && Array.isArray(backup.items)
       && backup.items.every((item) => typeof item?.setVideoId === 'string');
-    if (!valid) throw new Error('Not a valid Watch Later Shuffle backup.');
+    if (!valid) throw new Error('Not a valid Watch Later Tools backup.');
   }
 
   const api = {
@@ -270,6 +314,9 @@
     applyMove,
     planMoves,
     assertMoveOnly,
+    assertSingleRemove,
+    assertSingleAdd,
+    readAddedSetVideoId,
     keepBackups,
     toAction,
     parsePlaylistPage,
@@ -283,7 +330,7 @@
   if (typeof module !== 'undefined' && module.exports) {
     module.exports = api;
   } else {
-    root.__wlShuffle = root.__wlShuffle || {};
-    root.__wlShuffle.core = api;
+    root.__wlTools = root.__wlTools || {};
+    root.__wlTools.core = api;
   }
 })(globalThis);

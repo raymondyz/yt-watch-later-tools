@@ -1,9 +1,10 @@
 // YouTube access: page config, auth header, and request wrappers.
 (function (root) {
-  const ns = root.__wlShuffle;
+  const ns = root.__wlTools;
   const { core } = ns;
   const IT = core.INNERTUBE;
 
+  // Keeps the original "wls" prefix so settings survive the rename.
   const CONFIG_KEY = 'wls:config';
 
   const DEFAULT_CONFIG = {
@@ -53,7 +54,7 @@
     try {
       return sanitizeConfig(JSON.parse(text));
     } catch (err) {
-      console.warn(`[wls] Ignoring invalid ${CONFIG_KEY}.`, err);
+      console.warn(`[wlt] Ignoring invalid ${CONFIG_KEY}.`, err);
       return sanitizeConfig(null);
     }
   }
@@ -77,8 +78,8 @@
   }
 
   class EditRejectedError extends Error {
-    constructor() {
-      super('YouTube did not confirm the move.');
+    constructor(message = 'YouTube did not confirm the move.') {
+      super(message);
       this.name = 'EditRejectedError';
     }
   }
@@ -209,8 +210,9 @@
 
   // Retries network errors, 5xx and 429 with backoff, and 401/403 once (each
   // attempt rebuilds the auth header). Anything else is the caller's to handle.
-  // `guard` runs before every attempt and may throw to stop the run.
-  async function withRetries(send, { guard = () => {}, signal } = {}) {
+  // `guard` runs before every attempt and may throw to stop the run. Pass
+  // `retryTransient: false` for a request that must not be sent twice.
+  async function withRetries(send, { guard = () => {}, signal, retryTransient = true } = {}) {
     let failures = 0;
     let authRetried = false;
     while (true) {
@@ -226,19 +228,24 @@
           authRetried = true;
           continue;
         }
-        if (!isTransient(err) || failures >= CONFIG.maxRetries) throw err;
+        if (!retryTransient || !isTransient(err) || failures >= CONFIG.maxRetries) throw err;
         await sleep(1000 * 2 ** failures, signal);
         failures += 1;
       }
     }
   }
 
+  // Reads page after page; each page's token comes from the one before, so
+  // pages cannot be fetched in parallel. With `maxItems` it stops once it has
+  // that many, and `complete` says whether it reached the end.
   async function readPlaylist(playlistId, options = {}) {
     const items = new Map();
     const seenTokens = new Set();
+    const limit = options.maxItems ?? Infinity;
     let body = { browseId: IT.browseIdPrefix + playlistId };
     let displayedCount = null;
     let unmovable = 0;
+    let complete = false;
     while (true) {
       const json = await withRetries(() => innertubePost(IT.browsePath, body, options.signal), options);
       const page = core.parsePlaylistPage(json);
@@ -251,7 +258,8 @@
       }
       // A page with nothing new means the token led away from the playlist.
       const stalled = !isFirstPage && items.size === sizeBefore;
-      if (stalled || page.continuation === null || seenTokens.has(page.continuation)) break;
+      complete = stalled || page.continuation === null || seenTokens.has(page.continuation);
+      if (complete || items.size >= limit) break;
       seenTokens.add(page.continuation);
       body = { continuation: page.continuation };
       await sleep(CONFIG.delayMs, options.signal);
@@ -261,7 +269,7 @@
         + 'needed to move them. That is expected on a playlist you cannot edit. On your own '
         + 'playlist it means the response format changed: see the README.');
     }
-    return { items: [...items.values()], displayedCount };
+    return { items: [...items.values()], displayedCount, complete };
   }
 
   function sendViaYtAction(playlistId, actions) {
@@ -283,8 +291,8 @@
     }));
   }
 
-  // The only way this extension changes a playlist. Both transports go
-  // through the move-only check first.
+  // How shuffles and restores change a playlist. Both transports go through
+  // the move-only check first, so neither can ever remove a video.
   async function editPlaylist(playlistId, actions, { signal, known = null } = {}) {
     core.assertMoveOnly(actions, known);
     if (CONFIG.transport === 'ytAction') {
@@ -293,6 +301,32 @@
     }
     const json = await innertubePost(IT.editPlaylistPath, { playlistId, actions }, signal);
     if (!core.isEditSuccess(json)) throw new EditRejectedError();
+  }
+
+  // The only removal the extension sends, for the Remove button: one entry,
+  // by its setVideoId. Retrying is safe, because a second try can only find
+  // that same entry gone. Always uses fetch, since the answer matters.
+  async function removeFromPlaylist(playlistId, setVideoId, { signal } = {}) {
+    const actions = [{ action: IT.removeAction, setVideoId }];
+    core.assertSingleRemove(actions);
+    const json = await withRetries(
+      () => innertubePost(IT.editPlaylistPath, { playlistId, actions }, signal),
+      { signal }
+    );
+    if (!core.isEditSuccess(json)) throw new EditRejectedError('YouTube did not confirm the removal.');
+  }
+
+  // Undo's request. Sent once: if an answer is lost, a retry could add the
+  // video twice. Returns the new entry's setVideoId, or null if not given.
+  async function addToPlaylist(playlistId, videoId, { signal } = {}) {
+    const actions = [{ action: IT.addAction, [IT.addedVideoField]: videoId }];
+    core.assertSingleAdd(actions);
+    const json = await withRetries(
+      () => innertubePost(IT.editPlaylistPath, { playlistId, actions }, signal),
+      { signal, retryTransient: false }
+    );
+    if (!core.isEditSuccess(json)) throw new EditRejectedError('YouTube did not confirm adding the video back.');
+    return core.readAddedSetVideoId(json, videoId);
   }
 
   ns.innertube = {
@@ -306,6 +340,8 @@
     readSession,
     withRetries,
     readPlaylist,
-    editPlaylist
+    editPlaylist,
+    removeFromPlaylist,
+    addToPlaylist
   };
 })(globalThis);

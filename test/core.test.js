@@ -121,6 +121,69 @@ describe('assertMoveOnly', () => {
     assert.throws(() => core.assertMoveOnly([move('c', 'a')], known));
     assert.throws(() => core.assertMoveOnly([move('a', 'c')], known));
   });
+
+  it('accepts a move to the bottom, which names no other video', () => {
+    const toBottom = { action: 'ACTION_MOVE_VIDEO_BEFORE', setVideoId: 'a' };
+    assert.doesNotThrow(() => core.assertMoveOnly([toBottom]));
+    assert.doesNotThrow(() => core.assertMoveOnly([toBottom], new Set(['a'])));
+    assert.throws(() => core.assertMoveOnly([toBottom], new Set(['b'])), /not a plain move/);
+    assert.throws(() => core.assertMoveOnly([{ ...toBottom, movedSetVideoIdSuccessor: 'b' }]), /not a plain move/);
+    assert.throws(() => core.assertMoveOnly([{ ...toBottom, removedVideoId: 'v' }]), /not a plain move/);
+    assert.throws(() => core.assertMoveOnly([{ action: 'ACTION_MOVE_VIDEO_BEFORE' }]), /not a plain move/);
+  });
+});
+
+describe('assertSingleRemove', () => {
+  it('accepts exactly one removal by setVideoId', () => {
+    assert.doesNotThrow(() => core.assertSingleRemove([{ action: 'ACTION_REMOVE_VIDEO', setVideoId: 'a' }]));
+  });
+
+  it('refuses anything that could take more or another video', () => {
+    const refused = [
+      [],
+      null,
+      'a',
+      [{ action: 'ACTION_REMOVE_VIDEO', setVideoId: 'a' }, { action: 'ACTION_REMOVE_VIDEO', setVideoId: 'b' }],
+      [{ action: 'ACTION_REMOVE_VIDEO_BY_VIDEO_ID', removedVideoId: 'v' }],
+      [{ action: 'ACTION_REMOVE_VIDEO', setVideoId: 'a', removedVideoId: 'v' }],
+      [{ action: 'ACTION_REMOVE_VIDEO', setVideoId: '' }],
+      [{ action: 'ACTION_REMOVE_VIDEO', setVideoId: 42 }],
+      [{ action: 'ACTION_REMOVE_VIDEO' }],
+      [{ action: 'ACTION_MOVE_VIDEO_AFTER', setVideoId: 'a' }]
+    ];
+    for (const actions of refused) assert.throws(() => core.assertSingleRemove(actions), /exactly one video/);
+  });
+});
+
+describe('assertSingleAdd', () => {
+  it('accepts exactly one video', () => {
+    assert.doesNotThrow(() => core.assertSingleAdd([{ action: 'ACTION_ADD_VIDEO', addedVideoId: 'v' }]));
+  });
+
+  it('refuses anything else', () => {
+    const refused = [
+      [],
+      [{ action: 'ACTION_ADD_VIDEO', addedVideoId: 'v' }, { action: 'ACTION_ADD_VIDEO', addedVideoId: 'w' }],
+      [{ action: 'ACTION_ADD_VIDEO', addedVideoId: '' }],
+      [{ action: 'ACTION_ADD_VIDEO', addedVideoId: 'v', setVideoId: 'a' }],
+      [{ action: 'ACTION_REMOVE_VIDEO', setVideoId: 'a' }]
+    ];
+    for (const actions of refused) assert.throws(() => core.assertSingleAdd(actions), /exactly one video/);
+  });
+});
+
+describe('readAddedSetVideoId', () => {
+  const answer = (data) => ({ status: 'STATUS_SUCCEEDED', playlistEditResults: [{ playlistEditVideoAddedResultData: data }] });
+
+  it('reads the new entry from the answer', () => {
+    assert.equal(core.readAddedSetVideoId(answer({ videoId: 'v', setVideoId: 'n1' }), 'v'), 'n1');
+    assert.equal(core.readAddedSetVideoId(answer({ setVideoId: 'n1' }), 'v'), 'n1');
+  });
+
+  it('ignores another video and gives null when there is none', () => {
+    assert.equal(core.readAddedSetVideoId(answer({ videoId: 'w', setVideoId: 'n1' }), 'v'), null);
+    assert.equal(core.readAddedSetVideoId({ status: 'STATUS_SUCCEEDED' }, 'v'), null);
+  });
 });
 
 describe('keepBackups', () => {

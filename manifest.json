@@ -1,11 +1,11 @@
 {
   "manifest_version": 3,
-  "name": "Watch Later Shuffle",
-  "version": "0.1.0",
-  "description": "Permanently shuffle the saved order of your YouTube playlists, including Watch Later.",
+  "name": "Watch Later Tools",
+  "version": "0.3.0",
+  "description": "Extra tools for YouTube Watch Later and your own playlists: a permanent shuffle with automatic backups, and one-click move to top, move to bottom and remove.",
   "content_scripts": [{
     "matches": ["https://www.youtube.com/*"],
-    "js": ["src/core.js", "src/innertube.js", "src/ui.js", "src/main.js"],
+    "js": ["src/core.js", "src/innertube.js", "src/ui.js", "src/rows.js", "src/main.js"],
     "world": "MAIN",
     "run_at": "document_idle"
   }]

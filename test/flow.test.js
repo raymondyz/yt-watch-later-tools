@@ -53,7 +53,7 @@ function json(body, status = 200) {
 function toPage(server, offset) {
   const contents = server.order.slice(offset, offset + PAGE_SIZE).map((setVideoId) => ({
     playlistVideoRenderer: {
-      videoId: `v-${setVideoId}`,
+      videoId: server.videoIdOf?.(setVideoId) ?? `v-${setVideoId}`,
       setVideoId,
       title: { runs: [{ text: `Title ${setVideoId}` }] }
     }
@@ -80,11 +80,34 @@ function createServer(order) {
     // Return a response to override the edit, or nothing to apply it normally.
     onEdit: () => {},
     onRead: () => {},
+    // Entries whose video id is not `v-<setVideoId>`, such as added ones.
+    videoIds: new Map(),
+    added: 0,
+    // Where an added video goes: 'end' or 'top'.
+    addAt: 'end',
+    videoIdOf: (setVideoId) => server.videoIds.get(setVideoId) ?? `v-${setVideoId}`,
+    // Applies the edit and returns the results YouTube would report.
     apply(actions) {
+      const results = [];
       for (const action of actions) {
-        const after = action.movedSetVideoIdPredecessor ?? null;
-        server.order = core.applyMove(server.order, { setVideoId: action.setVideoId, after });
+        if (action.action === 'ACTION_REMOVE_VIDEO') {
+          server.order = server.order.filter((id) => id !== action.setVideoId);
+        } else if (action.action === 'ACTION_MOVE_VIDEO_BEFORE') {
+          // With no successor named, the video goes to the bottom.
+          server.order = [...server.order.filter((id) => id !== action.setVideoId), action.setVideoId];
+        } else if (action.action === 'ACTION_ADD_VIDEO') {
+          server.added += 1;
+          const setVideoId = `added-${server.added}`;
+          server.videoIds.set(setVideoId, action.addedVideoId);
+          if (server.addAt === 'top') server.order.unshift(setVideoId);
+          else server.order.push(setVideoId);
+          results.push({ playlistEditVideoAddedResultData: { videoId: action.addedVideoId, setVideoId } });
+        } else {
+          const after = action.movedSetVideoIdPredecessor ?? null;
+          server.order = core.applyMove(server.order, { setVideoId: action.setVideoId, after });
+        }
       }
+      return results;
     },
     async fetch(url, init) {
       server.headers.push(init.headers);
@@ -94,8 +117,8 @@ function createServer(order) {
         const override = await server.onEdit(server.edits, body);
         if (override === HANG) return hang(init.signal);
         if (override) return override;
-        server.apply(body.actions);
-        return json({ status: 'STATUS_SUCCEEDED' });
+        const results = server.apply(body.actions);
+        return json({ status: 'STATUS_SUCCEEDED', ...(results.length > 0 ? { playlistEditResults: results } : {}) });
       }
       server.reads += 1;
       const override = await server.onRead(server.reads, body);
@@ -120,10 +143,13 @@ function load(server, options = {}) {
     href,
     uiConfirm,
     locks = null,
-    storage = new Map()
+    storage = new Map(),
+    frozenClock,
+    signedIn = true
   } = options;
   if (Object.keys(config).length > 0) storage.set('wls:config', JSON.stringify(config));
   const views = [];
+  const rowViews = [];
   const events = [];
   const warnings = [];
   const errors = [];
@@ -167,7 +193,7 @@ function load(server, options = {}) {
       removeItem: (key) => storage.delete(key)
     },
     document: {
-      cookie: 'SAPISID=abc; __Secure-1PAPISID=def; __Secure-3PAPISID=ghi',
+      cookie: signedIn ? 'SAPISID=abc; __Secure-1PAPISID=def; __Secure-3PAPISID=ghi' : 'PREF=f6=40000000',
       title: 'My Mix - YouTube',
       addEventListener(type, listener) {
         documentListeners.set(type, [...(documentListeners.get(type) ?? []), listener]);
@@ -183,20 +209,29 @@ function load(server, options = {}) {
     ytcfg: { get: (key) => ytcfgData[key], data_: ytcfgData }
   };
   const context = vm.createContext(sandbox);
+  // Makes every Date.now() in the page return the same moment.
+  if (frozenClock !== undefined) vm.runInContext(`Date.now = () => ${frozenClock};`, context);
   for (const file of ['core.js', 'innertube.js']) {
     vm.runInContext(fs.readFileSync(path.join(SRC, file), 'utf8'), context);
   }
   // Stands in for ui.js and records everything main.js asks it to show.
-  sandbox.__wlShuffle.ui = {
+  sandbox.__wlTools.ui = {
     mount(handlers) {
-      sandbox.__wlShuffle.ui.handlers = handlers;
+      sandbox.__wlTools.ui.handlers = handlers;
     },
     render: (state) => views.push(state)
   };
-  if (uiConfirm) sandbox.__wlShuffle.ui.confirm = uiConfirm;
+  if (uiConfirm) sandbox.__wlTools.ui.confirm = uiConfirm;
+  // Stands in for rows.js and records what main.js tells the Remove buttons.
+  sandbox.__wlTools.rows = {
+    mount(handlers) {
+      sandbox.__wlTools.rows.handlers = handlers;
+    },
+    show: (state) => rowViews.push(state)
+  };
   vm.runInContext(fs.readFileSync(path.join(SRC, 'main.js'), 'utf8'), context);
   return {
-    api: sandbox.__wlShuffle,
+    api: sandbox.__wlTools,
     views,
     events,
     warnings,
@@ -206,7 +241,9 @@ function load(server, options = {}) {
     unloadListeners,
     ytcfgData,
     lastView: () => views.at(-1),
-    handlers: () => sandbox.__wlShuffle.ui.handlers,
+    handlers: () => sandbox.__wlTools.ui.handlers,
+    rowViews,
+    rowHandlers: () => sandbox.__wlTools.rows.handlers,
     // Stands in for a YouTube navigation inside the single-page app.
     navigate(nextHref, title = 'My Mix - YouTube') {
       url.href = nextHref;
@@ -455,6 +492,18 @@ describe('reading', () => {
     assert.deepEqual(setVideoIds(await api.fetchPlaylist()), ['s0', 's1']);
     assert.equal(server.reads, 2);
   });
+
+  it('can stop after the pages that hold the first videos', async () => {
+    const server = createServer(ids(10));
+    const { api } = load(server);
+    const start = await api.innertube.readPlaylist('WL', { maxItems: 4 });
+    assert.deepEqual(setVideoIds(start.items), ids(6));
+    assert.equal(start.complete, false);
+    assert.equal(server.reads, 2);
+    const all = await api.innertube.readPlaylist('WL', { maxItems: 10 });
+    assert.equal(all.items.length, 10);
+    assert.equal(all.complete, true);
+  });
 });
 
 describe('batching', () => {
@@ -697,13 +746,90 @@ describe('cancel', () => {
 });
 
 describe('verify', () => {
-  it('repairs a move that was silently dropped', async () => {
-    const server = createServer(ids(12));
-    const { api } = load(server);
-    server.onEdit = (count) => (count === 3 ? json({ status: 'STATUS_SUCCEEDED' }) : undefined);
+  it('reads back only as far as the first request reached after a clean shuffle', async () => {
+    const server = createServer(ids(30));
+    const { api } = load(server, { config: { batchSize: 6 } });
+    let lastOfFirstRequest = null;
+    let readsBeforeCheck = 0;
+    server.onEdit = (count, body) => {
+      if (count === 1) lastOfFirstRequest = body.actions.at(-1).setVideoId;
+      readsBeforeCheck = server.reads;
+    };
     const result = await api.run();
     assert.equal(result.status, 'done');
     assert.deepEqual(server.order, targetIds(result));
+    const reach = targetIds(result).indexOf(lastOfFirstRequest) + 1;
+    assert.equal(server.reads - readsBeforeCheck, Math.ceil(reach / PAGE_SIZE));
+    assert.ok(server.reads - readsBeforeCheck < 30 / PAGE_SIZE);
+  });
+
+  it('checks the whole playlist when the start does not match, and repairs it', async () => {
+    const server = createServer(ids(30));
+    const { api } = load(server, { config: { batchSize: 6 } });
+    // YouTube confirms the first round of moves but ignores them.
+    let ignoring = true;
+    let fullReads = 0;
+    server.onEdit = () => (ignoring ? json({ status: 'STATUS_SUCCEEDED' }) : undefined);
+    server.onRead = (_, body) => {
+      if (server.edits === 0 || !body.browseId) return;
+      ignoring = false;
+      fullReads += 1;
+    };
+    const result = await api.run();
+    assert.equal(result.status, 'done');
+    assert.deepEqual(server.order, targetIds(result));
+    // The quick check, then the full check, then the check after the repair.
+    assert.equal(fullReads, 3);
+  });
+
+  it('falls back to the full check when the quick read fails', async () => {
+    const server = createServer(ids(12));
+    const { api, views } = load(server, { config: { batchSize: 6 } });
+    let failures = 0;
+    server.onRead = () => {
+      if (server.edits === 0 || failures >= 4) return undefined;
+      failures += 1;
+      return json({}, 500);
+    };
+    const result = await api.run();
+    assert.equal(result.status, 'done');
+    assert.equal(failures, 4);
+    assert.deepEqual(server.order, targetIds(result));
+    assert.equal(views.some((view) => view.phase === 'paused'), false);
+  });
+
+  it('checks the whole playlist after a shuffle that had to plan again', async () => {
+    const server = createServer(ids(12));
+    const { api } = load(server);
+    server.onEdit = (count) => (count === 2 ? json({}, 400) : undefined);
+    const result = await api.run();
+    assert.equal(result.status, 'done');
+    assert.deepEqual(server.order, targetIds(result));
+    // The first read, the read after the rejection, and the full check.
+    assert.equal(server.reads, 3 * 12 / PAGE_SIZE);
+  });
+
+  it('always checks the whole playlist after a restore', async () => {
+    const server = createServer(ids(30));
+    const { api } = load(server, { config: { batchSize: 6 } });
+    await api.run();
+    const readsBefore = server.reads;
+    assert.equal((await api.restore()).status, 'done');
+    assert.deepEqual(server.order, ids(30));
+    assert.equal(server.reads - readsBefore, 2 * 30 / PAGE_SIZE);
+  });
+
+  it('repairs a move that was silently dropped during a restore', async () => {
+    const server = createServer(ids(12));
+    const { api } = load(server);
+    await api.run();
+    let edits = 0;
+    server.onEdit = () => {
+      edits += 1;
+      return edits === 3 ? json({ status: 'STATUS_SUCCEEDED' }) : undefined;
+    };
+    assert.equal((await api.restore()).status, 'done');
+    assert.deepEqual(server.order, ids(12));
   });
 
   it('reports items out of place when repair fails, and can retry', async () => {
@@ -777,8 +903,8 @@ describe('restore', () => {
 
 describe('ytAction transport', () => {
   it('dispatches edits through ytd-app and still reads with fetch', async () => {
-    const server = createServer(ids(6));
-    const { api, events } = load(server, { config: { transport: 'ytAction' } });
+    const server = createServer(ids(12));
+    const { api, events } = load(server, { config: { transport: 'ytAction', batchSize: 1 } });
     // Stand in for YouTube's app receiving the event.
     const seen = [];
     const original = events.push.bind(events);
@@ -794,6 +920,8 @@ describe('ytAction transport', () => {
     assert.equal(seen[0].type, 'yt-action');
     assert.equal(seen[0].detail.actionName, 'yt-service-request');
     assert.deepEqual(server.order, targetIds(result));
+    // No answers to rely on, so the whole playlist is checked.
+    assert.equal(server.reads, 2 * 12 / PAGE_SIZE);
   });
 });
 
@@ -804,10 +932,12 @@ describe('page wiring', () => {
     const onPlaylist = load(createServer(ids(3)), { href: MIX });
     assert.equal(onPlaylist.lastView().visible, true);
     assert.equal(onPlaylist.lastView().playlistLabel, 'My Mix');
+    assert.equal(onPlaylist.lastView().playlistId, 'PLmix');
 
     const server = createServer(ids(6));
     const elsewhere = load(server);
     assert.equal(elsewhere.lastView().visible, false);
+    assert.equal(elsewhere.lastView().playlistId, null);
     let shownDuringRun = false;
     server.onEdit = () => {
       shownDuringRun = elsewhere.lastView().visible;
@@ -943,6 +1073,366 @@ function seededRand(seed) {
   };
 }
 
+describe('remove button', () => {
+  const MY_LIST = 'https://www.youtube.com/playlist?list=PLmine';
+  const videoOrder = (server) => server.order.map(server.videoIdOf);
+
+  async function ready(env) {
+    await waitFor(() => env.rowViews.at(-1)?.removable === true);
+    return env.rowHandlers();
+  }
+
+  function editActions(server) {
+    const seen = [];
+    server.onEdit = (_, body) => {
+      seen.push(JSON.parse(JSON.stringify(body.actions)));
+    };
+    return seen;
+  }
+
+  it('shows on a playlist you can edit, and goes away elsewhere', async () => {
+    const server = createServer(ids(6));
+    const env = load(server, { href: WL_PAGE });
+    await ready(env);
+    assert.equal(env.rowViews.at(-1).label, 'Watch later');
+    assert.equal(server.reads, 1);
+    env.navigate('https://www.youtube.com/');
+    assert.equal(env.rowViews.at(-1).removable, false);
+  });
+
+  it('shows beside a video playing from the playlist, without reading again per video', async () => {
+    const server = createServer(ids(6));
+    const env = load(server, { href: 'https://www.youtube.com/watch?v=v-s0&list=WL&index=1' });
+    await ready(env);
+    assert.equal(env.rowViews.at(-1).playlistId, 'WL');
+    env.navigate('https://www.youtube.com/watch?v=v-s1&list=WL&index=2', 'Next - YouTube');
+    env.navigate('https://www.youtube.com/playlist?list=WL', 'Watch later - YouTube');
+    assert.equal(server.reads, 1);
+    assert.equal(env.rowViews.at(-1).removable, true);
+  });
+
+  it('skips mixes and the queue without a request', async () => {
+    const server = createServer(ids(6));
+    const env = load(server, { href: 'https://www.youtube.com/watch?v=v-s0&list=RDv-s0' });
+    env.navigate('https://www.youtube.com/watch?v=v-s0&list=TLPQMTEwNzIwMjY');
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.equal(server.reads, 0);
+    assert.equal(env.rowViews.some((view) => view.removable), false);
+  });
+
+  it('stays off on a playlist YouTube sends without setVideoIds', async () => {
+    const server = createServer(ids(4));
+    server.onRead = () => json({ contents: [{ lockupViewModel: { contentId: 'v1', contentType: 'LOCKUP_CONTENT_TYPE_VIDEO' } }] });
+    const env = load(server, { href: OTHER_PAGE });
+    await waitFor(() => server.reads === 1);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.equal(env.rowViews.some((view) => view.removable), false);
+    assert.deepEqual(env.errors, []);
+  });
+
+  it('stays off and sends nothing when signed out', async () => {
+    const server = createServer(ids(4));
+    const env = load(server, { href: WL_PAGE, signedIn: false });
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.equal(server.reads, 0);
+    assert.equal(env.rowViews.some((view) => view.removable), false);
+    assert.deepEqual(env.errors, []);
+  });
+
+  it('removes exactly the clicked video, in one request', async () => {
+    const server = createServer(ids(10));
+    const env = load(server, { href: WL_PAGE });
+    const rows = await ready(env);
+    const sent = editActions(server);
+    await rows.onRemove({ playlistId: 'WL', videoId: 'v-s4' });
+    assert.deepEqual(server.order, ids(10).filter((id) => id !== 's4'));
+    assert.deepEqual(sent, [[{ action: 'ACTION_REMOVE_VIDEO', setVideoId: 's4' }]]);
+  });
+
+  it('needs no extra read for a Watch later video on the first page', async () => {
+    const server = createServer(ids(10));
+    const env = load(server, { href: WL_PAGE });
+    const rows = await ready(env);
+    const reads = server.reads;
+    await rows.onRemove({ playlistId: 'WL', videoId: 'v-s1' });
+    assert.equal(server.reads, reads);
+    await rows.onRemove({ playlistId: 'WL', videoId: 'v-s8' });
+    assert.equal(server.reads, reads + Math.ceil(9 / PAGE_SIZE));
+    assert.deepEqual(server.order, ids(10).filter((id) => id !== 's1' && id !== 's8'));
+  });
+
+  it('reads all of another playlist first, and refuses a video that is in it twice', async () => {
+    const server = createServer(['a', 'b', 'c', 'd', 'e']);
+    // Entries a and d hold the same video.
+    server.videoIds.set('d', 'v-a');
+    const env = load(server, { href: MY_LIST });
+    const rows = await ready(env);
+    await assert.rejects(rows.onRemove({ playlistId: 'PLmine', videoId: 'v-a' }), /more than once/);
+    assert.equal(server.edits, 0);
+    await rows.onRemove({ playlistId: 'PLmine', videoId: 'v-b' });
+    assert.deepEqual(server.order, ['a', 'c', 'd', 'e']);
+    assert.deepEqual(env.errors, []);
+  });
+
+  it('refuses a video that is not in the playlist', async () => {
+    const server = createServer(ids(6));
+    const env = load(server, { href: WL_PAGE });
+    const rows = await ready(env);
+    await assert.rejects(rows.onRemove({ playlistId: 'WL', videoId: 'v-gone' }), /no longer in the playlist/);
+    assert.equal(server.edits, 0);
+  });
+
+  it('keeps the video and says so when YouTube refuses', async () => {
+    const server = createServer(ids(6));
+    const env = load(server, { href: WL_PAGE });
+    const rows = await ready(env);
+    server.onEdit = () => json({}, 400);
+    await assert.rejects(rows.onRemove({ playlistId: 'WL', videoId: 'v-s1' }), /^Error: Not removed\./);
+    server.onEdit = () => json({ status: 'STATUS_FAILED' });
+    await assert.rejects(rows.onRemove({ playlistId: 'WL', videoId: 'v-s1' }), /did not confirm the removal/);
+    assert.deepEqual(server.order, ids(6));
+  });
+
+  it('retries a removal after a network error, and removes only that video', async () => {
+    const server = createServer(ids(6));
+    const env = load(server, { href: WL_PAGE });
+    const rows = await ready(env);
+    server.onEdit = (count) => {
+      if (count === 1) throw new TypeError('Failed to fetch');
+    };
+    await rows.onRemove({ playlistId: 'WL', videoId: 'v-s1' });
+    assert.equal(server.edits, 2);
+    assert.deepEqual(server.order, ids(6).filter((id) => id !== 's1'));
+  });
+
+  it('refuses a click from a playlist that is no longer open', async () => {
+    const server = createServer(ids(6));
+    const env = load(server, { href: WL_PAGE });
+    const rows = await ready(env);
+    env.navigate(OTHER_PAGE, 'Other - YouTube');
+    await assert.rejects(rows.onRemove({ playlistId: 'WL', videoId: 'v-s1' }), /page changed/);
+    assert.equal(server.edits, 0);
+  });
+
+  it('undo puts the video back where it was', async () => {
+    const server = createServer(ids(8));
+    const env = load(server, { href: WL_PAGE });
+    const rows = await ready(env);
+    await rows.onRemove({ playlistId: 'WL', videoId: 'v-s3' });
+    const result = await rows.onUndo({ playlistId: 'WL', videoId: 'v-s3', afterVideoId: 'v-s2' });
+    assert.equal(result.placed, true);
+    assert.deepEqual(videoOrder(server), ids(8).map((id) => `v-${id}`));
+  });
+
+  it('undo puts the first video back at the top', async () => {
+    const server = createServer(ids(8));
+    const env = load(server, { href: WL_PAGE });
+    const rows = await ready(env);
+    await rows.onRemove({ playlistId: 'WL', videoId: 'v-s0' });
+    assert.equal((await rows.onUndo({ playlistId: 'WL', videoId: 'v-s0', afterVideoId: null })).placed, true);
+    assert.deepEqual(videoOrder(server), ids(8).map((id) => `v-${id}`));
+  });
+
+  it('undo leaves the video where it lands when its old place is unknown', async () => {
+    const server = createServer(ids(8));
+    const env = load(server, { href: WL_PAGE });
+    const rows = await ready(env);
+    await rows.onRemove({ playlistId: 'WL', videoId: 'v-s3' });
+    const sent = editActions(server);
+    const result = await rows.onUndo({ playlistId: 'WL', videoId: 'v-s3', afterVideoId: undefined });
+    assert.equal(result.placed, false);
+    assert.deepEqual(sent, [[{ action: 'ACTION_ADD_VIDEO', addedVideoId: 'v-s3' }]]);
+    assert.equal(videoOrder(server).at(-1), 'v-s3');
+  });
+
+  it('can remove a video again after undoing', async () => {
+    const server = createServer(ids(8));
+    const env = load(server, { href: WL_PAGE });
+    const rows = await ready(env);
+    await rows.onRemove({ playlistId: 'WL', videoId: 'v-s1' });
+    await rows.onUndo({ playlistId: 'WL', videoId: 'v-s1', afterVideoId: 'v-s0' });
+    await rows.onRemove({ playlistId: 'WL', videoId: 'v-s1' });
+    assert.deepEqual(videoOrder(server), ids(8).filter((id) => id !== 's1').map((id) => `v-${id}`));
+  });
+
+  it('sends undo once, even when its answer is lost, so it cannot add the video twice', async () => {
+    const server = createServer(ids(8));
+    const env = load(server, { href: WL_PAGE });
+    const rows = await ready(env);
+    await rows.onRemove({ playlistId: 'WL', videoId: 'v-s1' });
+    const edits = server.edits;
+    server.onEdit = () => {
+      throw new TypeError('Failed to fetch');
+    };
+    await assert.rejects(rows.onUndo({ playlistId: 'WL', videoId: 'v-s1', afterVideoId: 'v-s0' }), /^Error: Not added back\./);
+    assert.equal(server.edits, edits + 1);
+  });
+
+  it('finds the new entry by reading when YouTube does not name it', async () => {
+    const server = createServer(ids(8));
+    const env = load(server, { href: WL_PAGE });
+    const rows = await ready(env);
+    await rows.onRemove({ playlistId: 'WL', videoId: 'v-s4' });
+    server.onEdit = (_, body) => {
+      if (body.actions[0].action !== 'ACTION_ADD_VIDEO') return undefined;
+      server.apply(body.actions);
+      return json({ status: 'STATUS_SUCCEEDED' });
+    };
+    assert.equal((await rows.onUndo({ playlistId: 'WL', videoId: 'v-s4', afterVideoId: 'v-s3' })).placed, true);
+    assert.deepEqual(videoOrder(server), ids(8).map((id) => `v-${id}`));
+  });
+
+  it('says so when the video is back but not in its old place', async () => {
+    const server = createServer(ids(8));
+    const env = load(server, { href: WL_PAGE });
+    const rows = await ready(env);
+    await rows.onRemove({ playlistId: 'WL', videoId: 'v-s4' });
+    server.onEdit = (_, body) => (body.actions[0].action === 'ACTION_ADD_VIDEO' ? undefined : json({}, 400));
+    assert.equal((await rows.onUndo({ playlistId: 'WL', videoId: 'v-s4', afterVideoId: 'v-s3' })).placed, false);
+    assert.equal(videoOrder(server).filter((id) => id === 'v-s4').length, 1);
+    assert.equal(server.order.length, 8);
+  });
+
+  it('does not let a read that was under way bring back a removed entry', async () => {
+    const server = createServer(ids(10));
+    const env = load(server, { href: WL_PAGE });
+    const rows = await ready(env);
+    let release;
+    const gate = new Promise((resolve) => {
+      release = resolve;
+    });
+    // The first page of this read shows the playlist as it was before the removal.
+    server.onRead = async (_, body) => {
+      if (!body.browseId) return undefined;
+      const before = { order: server.order.slice(), videoIdOf: server.videoIdOf };
+      await gate;
+      return json(toPage(before, 0));
+    };
+    rows.onPrepare({ playlistId: 'WL', videoId: 'v-s8' });
+    await waitFor(() => server.reads === 2);
+    await rows.onRemove({ playlistId: 'WL', videoId: 'v-s1' });
+    release();
+    // The stale first page, then the two pages left of the nine videos.
+    await waitFor(() => server.reads === 4);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    server.onRead = () => undefined;
+    const edits = server.edits;
+    await assert.rejects(rows.onRemove({ playlistId: 'WL', videoId: 'v-s1' }), /no longer in the playlist/);
+    assert.equal(server.edits, edits);
+  });
+});
+
+describe('move buttons', () => {
+  const videoOrder = (server) => server.order.map(server.videoIdOf);
+  const refuseOneStep = (server) => {
+    server.onEdit = (_, body) => (body.actions[0].action === 'ACTION_MOVE_VIDEO_BEFORE' ? json({}, 400) : undefined);
+  };
+
+  async function ready(env) {
+    await waitFor(() => env.rowViews.at(-1)?.removable === true);
+    return env.rowHandlers();
+  }
+
+  function record(server) {
+    const sent = [];
+    const respond = server.onEdit;
+    server.onEdit = (count, body) => {
+      sent.push(JSON.parse(JSON.stringify(body.actions)));
+      return respond(count, body);
+    };
+    return sent;
+  }
+
+  it('moves a video to the top with one plain move', async () => {
+    const server = createServer(ids(8));
+    const env = load(server, { href: WL_PAGE });
+    const rows = await ready(env);
+    const sent = record(server);
+    await rows.onMove({ playlistId: 'WL', videoId: 'v-s2', to: 'top' });
+    assert.deepEqual(sent, [[{ action: 'ACTION_MOVE_VIDEO_AFTER', setVideoId: 's2' }]]);
+    assert.deepEqual(server.order, ['s2', 's0', 's1', 's3', 's4', 's5', 's6', 's7']);
+    assert.equal(server.reads, 1);
+  });
+
+  it('moves a video to the bottom in one step, without reading the playlist', async () => {
+    const server = createServer(ids(8));
+    const env = load(server, { href: WL_PAGE });
+    const rows = await ready(env);
+    const sent = record(server);
+    await rows.onMove({ playlistId: 'WL', videoId: 'v-s1', to: 'bottom' });
+    assert.deepEqual(sent, [[{ action: 'ACTION_MOVE_VIDEO_BEFORE', setVideoId: 's1' }]]);
+    assert.deepEqual(server.order, ['s0', 's2', 's3', 's4', 's5', 's6', 's7', 's1']);
+    assert.equal(server.reads, 1);
+  });
+
+  it('moves after the last video instead when YouTube refuses the one step, and remembers', async () => {
+    const server = createServer(ids(8));
+    const env = load(server, { href: WL_PAGE });
+    const rows = await ready(env);
+    refuseOneStep(server);
+    const sent = record(server);
+    await rows.onMove({ playlistId: 'WL', videoId: 'v-s1', to: 'bottom' });
+    assert.deepEqual(server.order, ['s0', 's2', 's3', 's4', 's5', 's6', 's7', 's1']);
+    await rows.onMove({ playlistId: 'WL', videoId: 'v-s0', to: 'bottom' });
+    assert.deepEqual(server.order, ['s2', 's3', 's4', 's5', 's6', 's7', 's1', 's0']);
+    assert.deepEqual(sent, [
+      [{ action: 'ACTION_MOVE_VIDEO_BEFORE', setVideoId: 's1' }],
+      [{ action: 'ACTION_MOVE_VIDEO_AFTER', setVideoId: 's1', movedSetVideoIdPredecessor: 's7' }],
+      [{ action: 'ACTION_MOVE_VIDEO_AFTER', setVideoId: 's0', movedSetVideoIdPredecessor: 's1' }]
+    ]);
+    assert.deepEqual(env.errors, []);
+  });
+
+  it('keeps trying the one step when the refusal was about something else', async () => {
+    const server = createServer(ids(8));
+    const env = load(server, { href: WL_PAGE });
+    const rows = await ready(env);
+    server.onEdit = () => json({}, 400);
+    await assert.rejects(rows.onMove({ playlistId: 'WL', videoId: 'v-s1', to: 'bottom' }), /^Error: Not moved\./);
+    server.onEdit = () => undefined;
+    const sent = record(server);
+    await rows.onMove({ playlistId: 'WL', videoId: 'v-s1', to: 'bottom' });
+    assert.deepEqual(sent, [[{ action: 'ACTION_MOVE_VIDEO_BEFORE', setVideoId: 's1' }]]);
+  });
+
+  it('retries a move after a network error', async () => {
+    const server = createServer(ids(8));
+    const env = load(server, { href: WL_PAGE });
+    const rows = await ready(env);
+    server.onEdit = (count) => {
+      if (count === 1) throw new TypeError('Failed to fetch');
+    };
+    await rows.onMove({ playlistId: 'WL', videoId: 'v-s3', to: 'top' });
+    assert.equal(server.order[0], 's3');
+    assert.equal(server.edits, 2);
+  });
+
+  it('never loses a video, whatever goes wrong', async () => {
+    for (let seed = 1; seed <= 20; seed++) {
+      const rand = seededRand(seed);
+      const server = createServer(ids(10));
+      const env = load(server, { href: WL_PAGE, config: { maxRetries: 1 } });
+      const rows = await ready(env);
+      server.onEdit = (_, body) => {
+        const roll = rand(6);
+        if (roll === 0) return json({}, 400);
+        if (roll === 1) return json({}, 503);
+        if (roll === 2) {
+          server.apply(body.actions);
+          return json({}, 500);
+        }
+        return undefined;
+      };
+      for (let step = 0; step < 8; step++) {
+        const videoId = `v-s${rand(10)}`;
+        const to = rand(2) === 0 ? 'top' : 'bottom';
+        await rows.onMove({ playlistId: 'WL', videoId, to }).catch(() => {});
+      }
+      assert.deepEqual(sorted(server.order), sorted(ids(10)), `seed ${seed}`);
+    }
+  });
+});
+
 describe('safety: no video is ever lost', () => {
   it('refuses any edit that is not a plain move before it reaches YouTube', async () => {
     for (const transport of ['fetch', 'ytAction']) {
@@ -961,6 +1451,15 @@ describe('safety: no video is ever lost', () => {
       assert.equal(server.edits, 0);
       assert.equal(events.length, 0);
     }
+  });
+
+  it('lets the Remove request name only one entry', async () => {
+    const server = createServer(ids(3));
+    const { api } = load(server);
+    for (const bad of ['', null, undefined, 42, ['s1']]) {
+      await assert.rejects(api.innertube.removeFromPlaylist('WL', bad), /exactly one video/);
+    }
+    assert.equal(server.edits, 0);
   });
 
   it('keeps every video when stopped after any number of moves', async () => {
@@ -983,6 +1482,7 @@ describe('safety: no video is ever lost', () => {
       const { api, lastView } = load(server, { config: { batchSize: 1 + rand(20), maxRetries: rand(2) } });
       const added = [];
       server.onEdit = (_, body) => {
+        for (const action of body.actions) assert.equal(action.action, 'ACTION_MOVE_VIDEO_AFTER', `seed ${seed}`);
         const roll = rand(10);
         if (roll === 0) return json({}, 400);
         if (roll === 1) return json({}, 503);
@@ -1134,6 +1634,19 @@ describe('safety: interrupted runs', () => {
 });
 
 describe('safety: backups', () => {
+  it('gives every backup its own time, even when saved in the same millisecond', async () => {
+    const server = createServer(ids(8));
+    const frozenClock = Date.parse('2026-01-01T00:00:00.000Z');
+    const { api, handlers, lastView, backups } = load(server, { href: WL_PAGE, frozenClock });
+    await api.run();
+    await api.run();
+    const times = backups().map((backup) => backup.createdAt);
+    assert.equal(new Set(times).size, 2);
+    // The older backup holds the original order.
+    await handlers().onRestore(lastView().backups[1].id);
+    assert.deepEqual(server.order, ids(8));
+  });
+
   it('refuses to start when the backup does not read back', async () => {
     const server = createServer(ids(6));
     const { api, lastView } = load(server, { storageSilent: true });
