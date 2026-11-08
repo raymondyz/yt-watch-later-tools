@@ -1,0 +1,17 @@
+# macOS
+.DS_Store
+
+# Editors
+.vscode/
+.idea/
+
+# Claude Code local settings
+.claude/settings.local.json
+
+# Packaged builds. Never commit the .pem: it is the extension's signing key.
+*.zip
+*.crx
+*.pem
+
+# Captured YouTube responses contain your playlist and account details.
+fixtures/

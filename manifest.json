@@ -1,0 +1,12 @@
+{
+  "manifest_version": 3,
+  "name": "Watch Later Shuffle",
+  "version": "0.1.0",
+  "description": "Permanently shuffle the order of your YouTube Watch Later playlist.",
+  "content_scripts": [{
+    "matches": ["https://www.youtube.com/*"],
+    "js": ["src/core.js", "src/innertube.js", "src/main.js"],
+    "world": "MAIN",
+    "run_at": "document_idle"
+  }]
+}
