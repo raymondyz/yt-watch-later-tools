@@ -12,6 +12,34 @@ const core = require('../src/core.js');
 
 const SRC = path.join(__dirname, '..', 'src');
 const PAGE_SIZE = 3;
+// Returned from onEdit or onRead: the request never answers until aborted.
+const HANG = Symbol('hang');
+
+function hang(signal) {
+  return new Promise((_, reject) => {
+    signal?.addEventListener('abort', () => reject(signal.reason ?? new Error('aborted')));
+  });
+}
+
+// Stands in for navigator.locks. Share one between two load() calls to
+// simulate two tabs; give each its own to simulate a tab that was closed.
+function createLocks() {
+  const held = new Set();
+  return {
+    async request(name, options, callback) {
+      if (held.has(name)) return callback(null);
+      held.add(name);
+      try {
+        return await callback({ name });
+      } finally {
+        held.delete(name);
+      }
+    },
+    async query() {
+      return { held: [...held].map((name) => ({ name })) };
+    }
+  };
+}
 
 function json(body, status = 200) {
   return {
@@ -30,13 +58,17 @@ function toPage(server, offset) {
       title: { runs: [{ text: `Title ${setVideoId}` }] }
     }
   }));
+  const page = { contents };
+  if (offset === 0 && server.displayed) {
+    page.header = { playlistHeaderRenderer: { numVideosText: { simpleText: `${server.displayed} videos` } } };
+  }
   if (offset + PAGE_SIZE < server.order.length) {
     const token = `offset:${offset + PAGE_SIZE}`;
     contents.push({
       continuationItemRenderer: { continuationEndpoint: { continuationCommand: { token } } }
     });
   }
-  return { contents };
+  return page;
 }
 
 function createServer(order) {
@@ -59,13 +91,15 @@ function createServer(order) {
       const body = JSON.parse(init.body);
       if (url.includes('browse/edit_playlist')) {
         server.edits += 1;
-        const override = server.onEdit(server.edits, body);
+        const override = await server.onEdit(server.edits, body);
+        if (override === HANG) return hang(init.signal);
         if (override) return override;
         server.apply(body.actions);
         return json({ status: 'STATUS_SUCCEEDED' });
       }
       server.reads += 1;
-      const override = server.onRead(server.reads, body);
+      const override = await server.onRead(server.reads, body);
+      if (override === HANG) return hang(init.signal);
       if (override) return override;
       const offset = body.continuation ? Number(body.continuation.split(':')[1]) : 0;
       return json(toPage(server, offset));
@@ -75,25 +109,45 @@ function createServer(order) {
 }
 
 function load(server, options = {}) {
-  const { confirmAnswer = true, config = {}, storageFull = false, href, uiConfirm } = options;
-  const storage = new Map();
+  // Most tests check per-move behavior, so they send one move per request.
+  // Pass `config: {}` to run with the real defaults.
+  const {
+    confirmAnswer = true,
+    config = { batchSize: 1 },
+    storageFull = false,
+    storageSilent = false,
+    storageLimit = Infinity,
+    href,
+    uiConfirm,
+    locks = null,
+    storage = new Map()
+  } = options;
   if (Object.keys(config).length > 0) storage.set('wls:config', JSON.stringify(config));
   const views = [];
   const events = [];
+  const warnings = [];
+  const errors = [];
+  let timers = 0;
   const unloadListeners = new Set();
   const documentListeners = new Map();
   const ytcfgData = { INNERTUBE_CONTEXT: { client: {} }, SESSION_INDEX: 0 };
   const url = new URL(href ?? 'https://www.youtube.com/');
   const sandbox = {
-    console: { log() {}, warn() {}, error() {} },
+    console: { log() {}, warn: (...args) => warnings.push(args), error: (...args) => errors.push(args) },
     crypto,
     TextEncoder,
     URLSearchParams,
     AbortController,
+    AbortSignal,
+    DOMException,
     clearTimeout,
-    setTimeout: (fn) => setTimeout(fn, 0),
+    setTimeout: (fn) => {
+      timers += 1;
+      return setTimeout(fn, 0);
+    },
     setInterval: () => 0,
     fetch: server.fetch,
+    navigator: locks ? { locks } : {},
     confirm: () => confirmAnswer,
     location: url,
     CustomEvent: class {
@@ -105,9 +159,12 @@ function load(server, options = {}) {
     localStorage: {
       getItem: (key) => storage.get(key) ?? null,
       setItem(key, value) {
-        if (storageFull && key.startsWith('wls:backup:')) throw new Error('quota');
+        const isBackup = key.startsWith('wls:backup:');
+        if (isBackup && (storageFull || value.length > storageLimit)) throw new Error('quota');
+        if (isBackup && storageSilent) return;
         storage.set(key, value);
-      }
+      },
+      removeItem: (key) => storage.delete(key)
     },
     document: {
       cookie: 'SAPISID=abc; __Secure-1PAPISID=def; __Secure-3PAPISID=ghi',
@@ -142,6 +199,9 @@ function load(server, options = {}) {
     api: sandbox.__wlShuffle,
     views,
     events,
+    warnings,
+    errors,
+    timers: () => timers,
     storage,
     unloadListeners,
     ytcfgData,
@@ -202,7 +262,7 @@ describe('run', () => {
   });
 
   it('saves a backup of the original order before the first move', async () => {
-    const server = createServer(ids(6));
+    const server = createServer(ids(12));
     const { api, backups } = load(server);
     let backedUpFirst = false;
     server.onEdit = (count) => {
@@ -213,15 +273,20 @@ describe('run', () => {
     const [backup] = backups();
     assert.equal(backup.version, 1);
     assert.equal(backup.playlistId, 'WL');
-    assert.deepEqual(backup.items.map((item) => item.setVideoId), ids(6));
+    assert.deepEqual(backup.items.map((item) => item.setVideoId), ids(12));
     assert.deepEqual(backup.items[0], { setVideoId: 's0', videoId: 'v-s0', title: 'Title s0' });
   });
 
-  it('keeps only the most recent backups, newest first', async () => {
+  it('keeps the newest backups and always the original order', async () => {
     const server = createServer(ids(6));
     const { api, backups } = load(server);
-    for (let i = 0; i < 4; i++) await api.run();
-    assert.equal(backups().length, 3);
+    const before = [];
+    for (let i = 0; i < 5; i++) {
+      before.push(server.order.slice());
+      await api.run();
+    }
+    const kept = backups().map((backup) => backup.items.map((item) => item.setVideoId));
+    assert.deepEqual(kept, [before[4], before[3], ids(6)]);
   });
 
   it('refuses to shuffle when the backup cannot be saved', async () => {
@@ -251,13 +316,20 @@ describe('run', () => {
   });
 
   it('allows one run at a time and warns before unload only while running', async () => {
-    const server = createServer(ids(6));
-    const { api, unloadListeners } = load(server);
+    const server = createServer(ids(12));
+    const { api, unloadListeners, errors } = load(server);
+    let warnedWhileMoving = false;
+    server.onEdit = () => {
+      warnedWhileMoving = unloadListeners.size === 1;
+    };
     const first = api.run();
-    await assert.rejects(api.run(), /already in progress/);
-    assert.equal(unloadListeners.size, 1);
-    await first;
+    await assert.rejects(api.run(), /already running in this tab/);
+    // Nothing has changed while the playlist is only being read.
     assert.equal(unloadListeners.size, 0);
+    await first;
+    assert.equal(warnedWhileMoving, true);
+    assert.equal(unloadListeners.size, 0);
+    assert.deepEqual(errors, []);
   });
 
   it('works on a playlist other than Watch Later', async () => {
@@ -382,6 +454,90 @@ describe('reading', () => {
     };
     assert.deepEqual(setVideoIds(await api.fetchPlaylist()), ['s0', 's1']);
     assert.equal(server.reads, 2);
+  });
+});
+
+describe('batching', () => {
+  it('sends 50 moves per request by default', async () => {
+    const server = createServer(ids(120));
+    const { api } = load(server, { config: {} });
+    const sizes = [];
+    server.onEdit = (_, body) => {
+      sizes.push(body.actions.length);
+    };
+    const result = await api.run();
+    assert.equal(result.status, 'done');
+    assert.deepEqual(server.order, targetIds(result));
+    assert.equal(sizes[0], 50);
+    assert.ok(sizes.length <= 3, `sent ${sizes.length} requests`);
+  });
+
+  it('halves the batch when YouTube rejects one, then finishes', async () => {
+    const server = createServer(ids(60));
+    const { api } = load(server, { config: {} });
+    const sizes = [];
+    server.onEdit = (_, body) => {
+      sizes.push(body.actions.length);
+      return body.actions.length > 10 ? json({}, 400) : undefined;
+    };
+    const result = await api.run();
+    assert.equal(result.status, 'done');
+    assert.deepEqual(server.order, targetIds(result));
+    assert.deepEqual(sizes.slice(0, 4), [50, 25, 12, 6]);
+    assert.ok(sizes.slice(3).every((size) => size <= 6));
+  });
+
+  it('stops only when a single move keeps being rejected', async () => {
+    const server = createServer(ids(60));
+    const { api, lastView } = load(server, { config: {} });
+    const sizes = [];
+    server.onEdit = (_, body) => {
+      sizes.push(body.actions.length);
+      return json({}, 400);
+    };
+    const result = await api.run();
+    assert.equal(result.status, 'failed');
+    assert.deepEqual(sizes, [50, 25, 12, 6, 3, 1, 1]);
+    assert.match(lastView().status, /refused to reorder this playlist/);
+    assert.deepEqual(sorted(server.order), sorted(ids(60)));
+  });
+
+  it('starts no timer when the delay is 0', async () => {
+    const { api, timers } = load(createServer(ids(3)), { config: {} });
+    const before = timers();
+    await api.innertube.sleep(0);
+    assert.equal(timers(), before);
+  });
+});
+
+describe('hidden videos', () => {
+  it('explains them in the question instead of logging a warning', async () => {
+    const server = createServer(ids(8));
+    server.displayed = 10;
+    let asked = null;
+    const { api, warnings } = load(server, {
+      uiConfirm: async (request) => {
+        asked = request;
+        return false;
+      }
+    });
+    await api.run();
+    assert.equal(asked.warning, '2 of the 10 videos are hidden or unavailable, so YouTube does not list them. They will not be moved.');
+    assert.deepEqual(warnings, []);
+  });
+
+  it('stays quiet when the counts match', async () => {
+    const server = createServer(ids(8));
+    server.displayed = 8;
+    let asked = null;
+    const { api } = load(server, {
+      uiConfirm: async (request) => {
+        asked = request;
+        return false;
+      }
+    });
+    await api.run();
+    assert.equal(asked.warning, '');
   });
 });
 
@@ -663,13 +819,9 @@ describe('page wiring', () => {
 
   it('names Watch Later, the open playlist, and other playlists by id', async () => {
     const server = createServer(ids(3));
-    const { api, navigate, lastView } = load(server, { href: MIX });
-    let label = null;
-    server.onEdit = () => {
-      label = lastView().playlistLabel;
-    };
+    const { api, navigate, lastView, views } = load(server, { href: MIX });
     await api.run({ playlistId: 'PLelsewhere' });
-    assert.equal(label, 'PLelsewhere');
+    assert.ok(views.some((view) => view.phase === 'reading' && view.playlistLabel === 'PLelsewhere'));
     navigate('https://www.youtube.com/playlist?list=WL', 'Watch later - YouTube');
     assert.equal(lastView().playlistLabel, 'Watch later');
     navigate(MIX, '(3) My Mix - YouTube');
@@ -677,7 +829,7 @@ describe('page wiring', () => {
   });
 
   it('shuffles the open playlist from the panel', async () => {
-    const server = createServer(ids(6));
+    const server = createServer(ids(12));
     const { handlers, lastView } = load(server, { href: MIX });
     const edited = new Set();
     server.onEdit = (_, body) => {
@@ -701,14 +853,14 @@ describe('page wiring', () => {
     assert.equal(listed[1].count, 6);
     assert.equal(listed[0].label, new Date(backups('PLmix')[0].createdAt).toLocaleString([], {
       dateStyle: 'medium',
-      timeStyle: 'short'
+      timeStyle: 'medium'
     }));
   });
 
   it('restores the chosen backup from the panel after confirming', async () => {
     const server = createServer(ids(8));
     const asked = [];
-    const { api, handlers } = load(server, {
+    const { api, handlers, lastView } = load(server, {
       href: MIX,
       uiConfirm: async (request) => {
         asked.push(request);
@@ -717,7 +869,7 @@ describe('page wiring', () => {
     });
     await api.run({ playlistId: 'PLmix' });
     await api.run({ playlistId: 'PLmix' });
-    const result = await handlers().onRestore(1);
+    const result = await handlers().onRestore(lastView().backups[1].id);
     assert.equal(result.status, 'done');
     assert.deepEqual(server.order, ids(8));
     assert.equal(asked.at(-1).confirmLabel, 'Restore order');
@@ -727,11 +879,11 @@ describe('page wiring', () => {
   it('does not restore when the confirmation is declined', async () => {
     const server = createServer(ids(8));
     const answers = [true, false];
-    const { api, handlers } = load(server, { href: MIX, uiConfirm: async () => answers.shift() });
+    const { api, handlers, lastView } = load(server, { href: MIX, uiConfirm: async () => answers.shift() });
     await api.run({ playlistId: 'PLmix' });
     const shuffled = server.order.slice();
     const edits = server.edits;
-    assert.equal((await handlers().onRestore(0)).status, 'declined');
+    assert.equal((await handlers().onRestore(lastView().backups[0].id)).status, 'declined');
     assert.equal(server.edits, edits);
     assert.deepEqual(server.order, shuffled);
   });
@@ -770,12 +922,368 @@ describe('page wiring', () => {
   });
 
   it('offers retry only on the playlist that needs it', async () => {
-    const server = createServer(ids(8));
+    const server = createServer(ids(12));
     const { api, navigate, lastView } = load(server, { href: MIX });
     server.onEdit = () => json({ status: 'STATUS_SUCCEEDED' });
     await api.run({ playlistId: 'PLmix' });
     assert.equal(lastView().canRetry, true);
     navigate('https://www.youtube.com/playlist?list=PLnext', 'Next - YouTube');
     assert.equal(lastView().canRetry, false);
+  });
+});
+
+const WL_PAGE = 'https://www.youtube.com/playlist?list=WL';
+const OTHER_PAGE = 'https://www.youtube.com/playlist?list=PLother';
+
+function seededRand(seed) {
+  let state = seed;
+  return (maxExclusive) => {
+    state = (state * 1664525 + 1013904223) % 0x100000000;
+    return state % maxExclusive;
+  };
+}
+
+describe('safety: no video is ever lost', () => {
+  it('refuses any edit that is not a plain move before it reaches YouTube', async () => {
+    for (const transport of ['fetch', 'ytAction']) {
+      const server = createServer(ids(3));
+      const { api, events } = load(server, { config: { transport } });
+      const attempts = [
+        [{ action: 'ACTION_REMOVE_VIDEO', setVideoId: 's1' }],
+        [{ action: 'ACTION_REMOVE_VIDEO_BY_VIDEO_ID', removedVideoId: 'v-s1' }],
+        [{ action: 'ACTION_MOVE_VIDEO_AFTER', setVideoId: 's1', removedVideoId: 'v-s1' }],
+        [{ action: 'ACTION_MOVE_VIDEO_AFTER', setVideoId: 's1', movedSetVideoIdPredecessor: 's1' }],
+        []
+      ];
+      for (const actions of attempts) {
+        await assert.rejects(api.innertube.editPlaylist('WL', actions), /not a plain move/);
+      }
+      assert.equal(server.edits, 0);
+      assert.equal(events.length, 0);
+    }
+  });
+
+  it('keeps every video when stopped after any number of moves', async () => {
+    for (let stopAt = 1; stopAt <= 12; stopAt++) {
+      const server = createServer(ids(12));
+      const { api } = load(server);
+      server.onEdit = (count) => {
+        if (count === stopAt) api.cancel();
+      };
+      await api.run();
+      assert.deepEqual(sorted(server.order), sorted(ids(12)), `stopped at ${stopAt}`);
+    }
+  });
+
+  it('keeps every video when everything goes wrong at random', async () => {
+    // CHAOS_SEEDS=1000 node --test test/ runs a longer search.
+    for (let seed = 1; seed <= Number(process.env.CHAOS_SEEDS ?? 30); seed++) {
+      const rand = seededRand(seed);
+      const server = createServer(ids(40));
+      const { api, lastView } = load(server, { config: { batchSize: 1 + rand(20), maxRetries: rand(2) } });
+      const added = [];
+      server.onEdit = (_, body) => {
+        const roll = rand(10);
+        if (roll === 0) return json({}, 400);
+        if (roll === 1) return json({}, 503);
+        if (roll === 2) return json({ status: 'STATUS_FAILED' });
+        if (roll === 3) {
+          server.apply(body.actions.slice(0, Math.ceil(body.actions.length / 2)));
+          return json({}, 500);
+        }
+        if (roll === 4) throw new TypeError('Failed to fetch');
+        if (roll === 5 && added.length < 3) {
+          const id = `new-${added.length}`;
+          added.push(id);
+          server.order.splice(rand(server.order.length), 0, id);
+        }
+        return undefined;
+      };
+      const pending = api.run();
+      const resumer = setInterval(() => {
+        if (lastView().phase === 'paused') api.resume();
+      }, 1);
+      const result = await pending;
+      clearInterval(resumer);
+      assert.ok(['done', 'partial', 'failed'].includes(result.status), `seed ${seed}: ${result.status}`);
+      assert.deepEqual(sorted(server.order), sorted([...ids(40), ...added]), `seed ${seed}`);
+    }
+  });
+});
+
+describe('safety: several tabs', () => {
+  it('lets only one tab change playlists at a time', async () => {
+    const locks = createLocks();
+    const storage = new Map();
+    const server = createServer(ids(10));
+    const first = load(server, { locks, storage, href: WL_PAGE });
+    const second = load(server, { locks, storage, href: WL_PAGE });
+    let secondResult = null;
+    server.onEdit = async (count) => {
+      if (count === 1) secondResult = await second.api.run();
+    };
+    assert.equal((await first.api.run()).status, 'done');
+    assert.equal(secondResult.status, 'failed');
+    assert.match(second.lastView().status, /Another YouTube tab is shuffling/);
+    assert.equal(first.backups().length, 1);
+    assert.deepEqual(second.errors, []);
+    server.onEdit = () => {};
+    assert.equal((await second.api.run()).status, 'done');
+  });
+
+  it('shows that another tab is busy instead of a false "didn\'t finish" notice', async () => {
+    const locks = createLocks();
+    const storage = new Map();
+    const server = createServer(ids(12));
+    const first = load(server, { locks, storage, href: WL_PAGE });
+    const second = load(server, { locks, storage, href: WL_PAGE });
+    let seen = null;
+    server.onEdit = async (count) => {
+      if (count !== 1) return;
+      second.navigate(WL_PAGE, 'Watch later - YouTube');
+      await waitFor(() => second.lastView().busyElsewhere === true);
+      seen = second.lastView();
+    };
+    await first.api.run();
+    assert.equal(seen.busyElsewhere, true);
+    assert.equal(seen.interrupted, null);
+    second.navigate(WL_PAGE, 'Watch later - YouTube');
+    await waitFor(() => second.lastView().busyElsewhere === false);
+  });
+
+  it('restores the backup that was clicked, even if another tab saved one since', async () => {
+    const storage = new Map();
+    const server = createServer(ids(8));
+    const here = load(server, { storage, href: WL_PAGE });
+    await here.api.run();
+    const clicked = here.lastView().backups[0].id;
+    const other = load(server, { storage, href: WL_PAGE });
+    await other.api.run();
+    assert.notEqual(other.lastView().backups[0].id, clicked);
+    await here.handlers().onRestore(clicked);
+    assert.deepEqual(server.order, ids(8));
+  });
+});
+
+describe('safety: interrupted runs', () => {
+  it('reports a run whose tab closed partway, when the playlist opens again', async () => {
+    const storage = new Map();
+    const server = createServer(ids(10));
+    const closed = load(server, { storage, href: WL_PAGE });
+    server.onEdit = (count) => (count === 3 ? HANG : undefined);
+    const pending = closed.api.run();
+    await waitFor(() => server.edits === 3);
+    // A fresh page with the same storage and no lock held: the old tab is gone.
+    const reopened = load(server, { storage, href: WL_PAGE });
+    const notice = reopened.lastView().interrupted;
+    assert.equal(notice.title, 'Last shuffle didn\'t finish');
+    assert.match(notice.message, /No videos were lost/);
+    assert.equal(reopened.lastView().backups.length, 1);
+    assert.deepEqual(sorted(server.order), sorted(ids(10)));
+    reopened.handlers().onDismiss();
+    assert.equal(reopened.lastView().interrupted, null);
+    closed.api.cancel();
+    await pending;
+  });
+
+  it('keeps the notice after Stop without repeating the Stop message, and clears it once a run finishes', async () => {
+    const server = createServer(ids(10));
+    const env = load(server, { href: WL_PAGE });
+    server.onEdit = (count) => {
+      if (count === 3) env.api.cancel();
+    };
+    await env.api.run();
+    assert.equal(env.lastView().phase, 'cancelled');
+    assert.match(env.lastView().status, /^Stopped at 3 \/ \d+\. No videos were lost/);
+    assert.equal(env.lastView().interrupted, null);
+    env.navigate(OTHER_PAGE, 'Other - YouTube');
+    env.navigate(WL_PAGE, 'Watch later - YouTube');
+    assert.equal(env.lastView().interrupted.title, 'Last shuffle didn\'t finish');
+    server.onEdit = () => {};
+    await env.api.run();
+    env.navigate(OTHER_PAGE, 'Other - YouTube');
+    env.navigate(WL_PAGE, 'Watch later - YouTube');
+    assert.equal(env.lastView().interrupted, null);
+  });
+
+  it('records nothing when stopped before anything changed', async () => {
+    const server = createServer(ids(6));
+    const env = load(server, { href: WL_PAGE });
+    server.onRead = () => {
+      env.api.cancel();
+    };
+    assert.equal((await env.api.run()).status, 'cancelled');
+    assert.equal(env.lastView().status, 'Stopped. Nothing was changed.');
+    assert.equal([...env.storage.keys()].some((key) => key.startsWith('wls:active:')), false);
+  });
+
+  it('warns before closing the tab only while the playlist is changing', async () => {
+    const server = createServer(ids(6));
+    let warnedAtQuestion = null;
+    const env = load(server, {
+      href: WL_PAGE,
+      uiConfirm: async () => {
+        warnedAtQuestion = env.unloadListeners.size;
+        return true;
+      }
+    });
+    await env.api.run();
+    assert.equal(warnedAtQuestion, 0);
+    assert.equal(env.unloadListeners.size, 0);
+  });
+});
+
+describe('safety: backups', () => {
+  it('refuses to start when the backup does not read back', async () => {
+    const server = createServer(ids(6));
+    const { api, lastView } = load(server, { storageSilent: true });
+    assert.equal((await api.run()).status, 'failed');
+    assert.equal(server.edits, 0);
+    assert.match(lastView().status, /Could not save a backup, so nothing was changed/);
+  });
+
+  it('drops middle backups, never the original, when storage runs short', async () => {
+    const storage = new Map();
+    const server = createServer(ids(30));
+    const roomy = load(server, { storage });
+    for (let i = 0; i < 3; i++) await roomy.api.run();
+    const limit = storage.get('wls:backup:WL').length - 1;
+    const tight = load(server, { storage, storageLimit: limit });
+    const before = server.order.slice();
+    assert.equal((await tight.api.run()).status, 'done');
+    const kept = tight.backups().map((backup) => backup.items.map((item) => item.setVideoId));
+    assert.deepEqual(kept, [before, ids(30)]);
+  });
+
+  it('ignores nonsense settings instead of running without a backup', async () => {
+    const server = createServer(ids(8));
+    const config = {
+      batchSize: 'lots',
+      maxRetries: 'x',
+      backupsToKeep: 0,
+      transport: 'carrier pigeon',
+      authParts: 'all',
+      delayMs: -5,
+      requestTimeoutMs: 1
+    };
+    const { api, backups } = load(server, { config });
+    assert.equal(api.config.batchSize, 50);
+    assert.equal(api.config.maxRetries, 3);
+    assert.equal(api.config.backupsToKeep, 2);
+    assert.equal(api.config.transport, 'fetch');
+    assert.equal(api.config.authParts.length, 3);
+    assert.equal(api.config.delayMs, 0);
+    assert.equal(api.config.requestTimeoutMs, 1000);
+    assert.equal((await api.run()).status, 'done');
+    assert.equal(backups().length, 1);
+  });
+});
+
+describe('safety: requests that never answer', () => {
+  it('Stop ends a run even while a request hangs', async () => {
+    const server = createServer(ids(8));
+    const { api, lastView } = load(server);
+    server.onEdit = (count) => (count === 2 ? HANG : undefined);
+    const pending = api.run();
+    await waitFor(() => server.edits === 2);
+    api.cancel();
+    assert.equal((await pending).status, 'cancelled');
+    assert.match(lastView().status, /^Stopped at 1 \//);
+    assert.deepEqual(sorted(server.order), sorted(ids(8)));
+  });
+
+  it('gives up on a hung request, pauses, and finishes on resume', async () => {
+    const server = createServer(ids(8));
+    const { api, lastView } = load(server, { config: { batchSize: 1, maxRetries: 0, requestTimeoutMs: 1000 } });
+    server.onEdit = (count) => (count === 2 ? HANG : undefined);
+    const pending = api.run();
+    await waitFor(() => lastView().phase === 'paused');
+    assert.match(lastView().status, /no answer within 1 s/);
+    api.resume();
+    const result = await pending;
+    assert.equal(result.status, 'done');
+    assert.deepEqual(server.order, targetIds(result));
+  });
+});
+
+describe('safety: impatient users', () => {
+  it('starts one run however many times Shuffle is clicked', async () => {
+    const server = createServer(ids(10));
+    const { handlers, backups, lastView, errors } = load(server, { href: WL_PAGE, config: {} });
+    await Promise.all(Array.from({ length: 5 }, () => handlers().onShuffle()));
+    assert.equal(backups().length, 1);
+    assert.equal(server.edits, 1);
+    assert.equal(lastView().phase, 'done');
+    assert.deepEqual(errors, []);
+  });
+
+  it('restores once however many times Restore is clicked', async () => {
+    const server = createServer(ids(10));
+    const { api, handlers, lastView, errors } = load(server, { href: WL_PAGE, config: {} });
+    await api.run();
+    const id = lastView().backups[0].id;
+    const edits = server.edits;
+    await Promise.all(Array.from({ length: 5 }, () => handlers().onRestore(id)));
+    assert.deepEqual(server.order, ids(10));
+    assert.equal(server.edits, edits + 1);
+    assert.deepEqual(errors, []);
+  });
+
+  it('drops an open restore question when another playlist opens', async () => {
+    const server = createServer(ids(6));
+    let asked = 0;
+    const env = load(server, {
+      href: WL_PAGE,
+      uiConfirm: (request, signal) => {
+        asked += 1;
+        if (asked === 1) return Promise.resolve(true);
+        return new Promise((resolve) => signal.addEventListener('abort', () => resolve(false)));
+      }
+    });
+    await env.api.run();
+    const shuffled = server.order.slice();
+    const pending = env.handlers().onRestore(env.lastView().backups[0].id);
+    await waitFor(() => asked === 2);
+    env.navigate(OTHER_PAGE, 'Other - YouTube');
+    assert.equal((await pending).status, 'declined');
+    assert.deepEqual(server.order, shuffled);
+  });
+
+  it('stops a run whose moves keep being refused', async () => {
+    const server = createServer(ids(30));
+    const { api, lastView } = load(server);
+    // Pathological: every move is applied but reported as rejected.
+    server.onEdit = (_, body) => {
+      server.apply(body.actions);
+      return json({}, 400);
+    };
+    assert.equal((await api.run()).status, 'failed');
+    assert.match(lastView().status, /kept refusing the moves/);
+    assert.equal(server.edits, 21);
+    assert.deepEqual(sorted(server.order), sorted(ids(30)));
+  });
+
+  it('spaces out fallback requests, which get no answer to wait for', () => {
+    const { api } = load(createServer(ids(3)), { config: { transport: 'ytAction' } });
+    assert.ok(api.innertube.requestGap() >= 1000);
+  });
+});
+
+describe('safety: impatient users, continued', () => {
+  it('ignores a second Resume click', async () => {
+    const server = createServer(ids(8));
+    const { api, lastView, errors } = load(server);
+    let failing = true;
+    server.onEdit = (count) => (count > 2 && failing ? json({}, 503) : undefined);
+    const pending = api.run();
+    await waitFor(() => lastView().phase === 'paused');
+    failing = false;
+    api.resume();
+    assert.equal(lastView().phase, 'paused');
+    await Promise.resolve();
+    assert.notEqual(lastView().phase, 'paused');
+    assert.doesNotThrow(() => api.resume());
+    assert.equal((await pending).status, 'done');
+    assert.deepEqual(errors, []);
   });
 });

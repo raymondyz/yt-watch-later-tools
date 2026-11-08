@@ -95,6 +95,50 @@ describe('planMoves', () => {
   });
 });
 
+describe('assertMoveOnly', () => {
+  const move = (setVideoId, after) => core.toAction({ setVideoId, after });
+
+  it('accepts plain moves', () => {
+    assert.doesNotThrow(() => core.assertMoveOnly([move('a', null), move('b', 'a')]));
+    assert.doesNotThrow(() => core.assertMoveOnly([move('b', 'a')], new Set(['a', 'b'])));
+  });
+
+  it('refuses everything else', () => {
+    const refused = [
+      [],
+      null,
+      [{ action: 'ACTION_REMOVE_VIDEO', setVideoId: 'a' }],
+      [{ ...move('a', null), removedVideoId: 'v' }],
+      [move('a', 'a')],
+      [{ action: 'ACTION_MOVE_VIDEO_AFTER' }],
+      [move('a', null), { action: 'ACTION_REMOVE_VIDEO', setVideoId: 'b' }]
+    ];
+    for (const actions of refused) assert.throws(() => core.assertMoveOnly(actions), /not a plain move/);
+  });
+
+  it('refuses ids that are not in the playlist', () => {
+    const known = new Set(['a', 'b']);
+    assert.throws(() => core.assertMoveOnly([move('c', 'a')], known));
+    assert.throws(() => core.assertMoveOnly([move('a', 'c')], known));
+  });
+});
+
+describe('keepBackups', () => {
+  it('keeps everything under the limit', () => {
+    assert.deepEqual(core.keepBackups([1, 2, 3], 3), [1, 2, 3]);
+  });
+
+  it('drops middle backups and always keeps the oldest', () => {
+    assert.deepEqual(core.keepBackups([5, 4, 3, 2, 1], 3), [5, 4, 1]);
+    assert.deepEqual(core.keepBackups([5, 4, 3, 2, 1], 2), [5, 1]);
+  });
+
+  it('never keeps fewer than the newest and the oldest', () => {
+    assert.deepEqual(core.keepBackups([3, 2, 1], 1), [3, 1]);
+    assert.deepEqual(core.keepBackups([3, 2, 1], 0), [3, 1]);
+  });
+});
+
 describe('toAction', () => {
   it('emits the predecessor when after is set', () => {
     assert.deepEqual(core.toAction({ setVideoId: 'a', after: 'b' }), {

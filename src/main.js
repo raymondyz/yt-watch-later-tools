@@ -1,13 +1,26 @@
 // Wiring: runs, cancel, restore, navigation detection, and the console API.
+//
+// Safety rules this file keeps:
+// - The only edits ever sent are moves (checked in innertube.editPlaylist),
+//   so no path can remove a video. Stopping at any point leaves every video
+//   in the playlist.
+// - Nothing changes until a backup has been saved and read back.
+// - One run at a time across every YouTube tab (Web Locks).
+// - A run that starts changing a playlist is recorded until it finishes, so a
+//   closed tab or a crash is reported the next time the playlist is opened.
 (function (root) {
   const ns = root.__wlShuffle;
   const { core, innertube: it } = ns;
   const { CONFIG } = it;
 
   const BACKUP_PREFIX = 'wls:backup:';
+  const JOURNAL_PREFIX = 'wls:active:';
+  const RUN_LOCK = 'wls:run';
   const WATCH_LATER = 'WL';
   // YouTube can take a moment to reflect the last move in a fresh read.
   const SETTLE_MS = 1000;
+  // Stops a run whose moves keep being refused for changing reasons.
+  const MAX_REJECTIONS = 20;
 
   class CancelledError extends Error {
     constructor() {
@@ -16,9 +29,15 @@
     }
   }
 
+  // Expected situations, such as a second click. Shown in the panel but not
+  // logged, because Chrome lists logged errors on the extension's Errors page.
+  class UserError extends Error {}
+
   let running = false;
   let activeJob = null;
   let retryable = null;
+  let busyElsewhere = false;
+  let restoreQuestion = null;
 
   const view = { phase: 'idle', done: 0, total: 0, status: '', statusKind: 'info', playlistLabel: '' };
 
@@ -41,23 +60,66 @@
   }
 
   function formatDate(iso) {
-    return new Date(iso).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' });
+    return new Date(iso).toLocaleString([], { dateStyle: 'medium', timeStyle: 'medium' });
+  }
+
+  function readStored(key) {
+    try {
+      return JSON.parse(localStorage.getItem(key));
+    } catch (err) {
+      return null;
+    }
   }
 
   function loadBackups(playlistId) {
+    const backups = readStored(BACKUP_PREFIX + playlistId);
+    return Array.isArray(backups) ? backups : [];
+  }
+
+  function loadJournal(playlistId) {
+    const journal = readStored(JOURNAL_PREFIX + playlistId);
+    return typeof journal?.startedAt === 'string' ? journal : null;
+  }
+
+  function writeJournal(playlistId, kind) {
     try {
-      const backups = JSON.parse(localStorage.getItem(BACKUP_PREFIX + playlistId));
-      return Array.isArray(backups) ? backups : [];
+      localStorage.setItem(JOURNAL_PREFIX + playlistId, JSON.stringify({ kind, startedAt: new Date().toISOString() }));
     } catch (err) {
-      return [];
+      log('Could not record the run.', err);
+    }
+  }
+
+  function clearJournal(playlistId) {
+    try {
+      localStorage.removeItem(JOURNAL_PREFIX + playlistId);
+    } catch (err) {
+      log('Could not clear the run record.', err);
     }
   }
 
   function describeBackups(playlistId) {
-    return loadBackups(playlistId).map((backup) => ({
+    const backups = loadBackups(playlistId);
+    return backups.map((backup, index) => ({
+      id: backup.createdAt,
       label: formatDate(backup.createdAt),
-      count: Array.isArray(backup.items) ? backup.items.length : 0
+      count: Array.isArray(backup.items) ? backup.items.length : 0,
+      note: index === 0 ? 'latest' : index === backups.length - 1 ? 'oldest' : ''
     }));
+  }
+
+  // A run on this playlist started changing it and never finished, for
+  // example because its tab was closed. Not shown right after a run in this
+  // tab ends, because the status line already says what happened.
+  function describeInterrupted(playlistId) {
+    const journal = loadJournal(playlistId);
+    if (!journal || busyElsewhere || view.phase !== 'idle') return null;
+    const what = journal.kind === 'restore' ? 'restore' : 'shuffle';
+    return {
+      title: `Last ${what} didn't finish`,
+      message: `A ${what} of this playlist started ${formatDate(journal.startedAt)} didn't finish, `
+        + 'so its order may be partly changed. No videos were lost. To put it back, restore a '
+        + 'backup below, or shuffle again.'
+    };
   }
 
   function refreshView() {
@@ -68,6 +130,8 @@
       visible: running || pagePlaylist !== null,
       playlistLabel: running ? view.playlistLabel : (pagePlaylist && playlistLabel(pagePlaylist)) || '',
       backups: idle ? describeBackups(pagePlaylist) : [],
+      interrupted: idle ? describeInterrupted(pagePlaylist) : null,
+      busyElsewhere: idle && busyElsewhere,
       canRetry: idle && retryable?.playlistId === pagePlaylist
     });
   }
@@ -87,16 +151,26 @@
     });
   }
 
-  // A shuffle never starts without a backup, so a failure here stops the run.
+  function isSaved(backup) {
+    const [saved] = loadBackups(backup.playlistId);
+    return saved?.createdAt === backup.createdAt && saved.items?.length === backup.items.length;
+  }
+
+  // Nothing changes until the backup has been written and read back. If
+  // storage is short, the middle backups go first; the oldest always stays.
   function saveBackup(playlistId, items) {
     const backup = { version: 1, createdAt: new Date().toISOString(), playlistId, items };
-    try {
-      const backups = [backup, ...loadBackups(playlistId)].slice(0, CONFIG.backupsToKeep);
-      localStorage.setItem(BACKUP_PREFIX + playlistId, JSON.stringify(backups));
-    } catch (err) {
-      throw new Error('Could not save a backup, so nothing was changed. Browser storage for '
-        + 'youtube.com may be full.', { cause: err });
+    const all = [backup, ...loadBackups(playlistId)];
+    for (const backups of [core.keepBackups(all, CONFIG.backupsToKeep), core.keepBackups(all, 2)]) {
+      try {
+        localStorage.setItem(BACKUP_PREFIX + playlistId, JSON.stringify(backups));
+        if (isSaved(backup)) return;
+      } catch (err) {
+        log('Could not save the backup.', err);
+      }
     }
+    throw new Error('Could not save a backup, so nothing was changed. Browser storage for '
+      + 'youtube.com may be full or blocked.');
   }
 
   function createJob(playlistId) {
@@ -105,12 +179,15 @@
     const job = {
       playlistId,
       label: playlistLabel(playlistId),
+      batchSize: Math.max(1, Math.floor(CONFIG.batchSize) || 1),
       abort,
       signal: abort.signal,
       target: [],
       byId: new Map(),
       done: 0,
       total: 0,
+      rejections: 0,
+      changing: false,
       resume: null,
       guard() {
         if (abort.signal.aborted) throw new CancelledError();
@@ -124,7 +201,7 @@
   }
 
   async function pause(job, err) {
-    console.warn('[wls] Pausing.', err);
+    log('Pausing.', err);
     update({
       phase: 'paused',
       status: `Paused at ${job.done} / ${job.total}. ${err.message}`,
@@ -136,6 +213,8 @@
     });
     job.resume = null;
     job.guard();
+    // Leave the paused state at once, so a second click on Resume does nothing.
+    update({ phase: 'reading', status: 'Reading the playlist again...' });
   }
 
   // Always a full fresh read: planning from a stale list causes HTTP 400s.
@@ -161,22 +240,41 @@
     return `${move.setVideoId}>${move.after}`;
   }
 
-  // Sends moves one request at a time. Returns null when all were sent, or
-  // { rejected } when the caller should re-read the list and plan again.
+  // A rejected batch is retried at half the size. A single move rejected
+  // twice in a row stops the run, and so does an endless run of rejections.
+  function handleRejection(job, batch, lastRejected, err) {
+    job.rejections += 1;
+    if (job.rejections > MAX_REJECTIONS) throw new Error('YouTube kept refusing the moves, so the run stopped.');
+    if (batch.length > 1) {
+      job.batchSize = Math.max(1, Math.floor(batch.length / 2));
+      log(`Batch of ${batch.length} rejected, retrying with ${job.batchSize}.`, err);
+      return { rejected: null };
+    }
+    const key = moveKey(batch[0]);
+    if (key === lastRejected) {
+      throw new Error(job.done === 0
+        ? 'YouTube refused to reorder this playlist. Some playlists, such as Liked videos, cannot be reordered.'
+        : `YouTube rejected the same move twice (${key}). ${err.message}`);
+    }
+    log('Move rejected, planning again.', err);
+    return { rejected: key };
+  }
+
+  // Sends moves in batches, one request at a time. Returns null when all were
+  // sent, or { rejected } when the caller should re-read the list and plan again.
   async function sendMoves(job, moves, lastRejected) {
-    const size = Math.max(1, CONFIG.batchSize);
+    const size = job.batchSize;
     let rejected = lastRejected;
     for (let i = 0; i < moves.length; i += size) {
       const batch = moves.slice(i, i + size);
-      const key = moveKey(batch[0]);
+      const actions = batch.map(core.toAction);
       try {
-        await it.withRetries(() => it.editPlaylist(job.playlistId, batch.map(core.toAction)), job);
+        await it.withRetries(
+          () => it.editPlaylist(job.playlistId, actions, { signal: job.signal, known: job.byId }),
+          job
+        );
       } catch (err) {
-        if (it.isRejection(err)) {
-          if (key === rejected) throw new Error(`YouTube rejected the same move twice (${key}). ${err.message}`);
-          console.warn('[wls] Move rejected, planning again.', err);
-          return { rejected: key };
-        }
+        if (it.isRejection(err)) return handleRejection(job, batch, rejected, err);
         if (!it.isTransient(err)) throw err;
         await pause(job, err);
         return { rejected };
@@ -184,7 +282,7 @@
       rejected = null;
       job.done += batch.length;
       showProgress(job);
-      await it.sleep(CONFIG.delayMs, job.signal);
+      await it.sleep(it.requestGap(), job.signal);
       job.guard();
     }
     return null;
@@ -222,6 +320,7 @@
   }
 
   function finish(job, verb, misplaced) {
+    clearJournal(job.playlistId);
     const count = job.target.length;
     const target = job.target.map((id) => job.byId.get(id));
     if (misplaced === 0) {
@@ -240,8 +339,21 @@
     return { status: 'partial', outOfPlace: misplaced, target };
   }
 
+  function warnBeforeUnload(event) {
+    event.preventDefault();
+    event.returnValue = '';
+  }
+
+  // From here until the run ends, the playlist may differ from its backup.
+  function startChanging(job, kind) {
+    job.changing = true;
+    writeJournal(job.playlistId, kind);
+    root.addEventListener('beforeunload', warnBeforeUnload);
+  }
+
   async function drive(job, order, target, verb) {
     job.target = target;
+    startChanging(job, verb === 'Restored' ? 'restore' : 'shuffle');
     await executeMoves(job, order);
     const misplaced = await verify(job);
     log('Target order:', job.target.map((id) => job.byId.get(id)?.title ?? id));
@@ -256,42 +368,53 @@
   }
 
   function endWithError(err, job) {
+    const partly = ' No videos were lost, but the order may be partly changed. Restore a backup to put it back.';
     if (err instanceof CancelledError) {
       update({
         phase: 'cancelled',
-        status: `Stopped at ${job.done} / ${job.total}. No videos were lost, but the order is only `
-          + 'partly changed. Restore the latest backup to undo it.'
+        status: job.changing ? `Stopped at ${job.done} / ${job.total}.${partly}` : 'Stopped. Nothing was changed.'
       });
       return { status: 'cancelled' };
     }
-    console.error('[wls]', err);
-    const status = describeFailure(err);
+    if (!(err instanceof UserError)) console.error('[wls]', err);
+    const status = describeFailure(err) + (job.changing ? partly : '');
     update({ phase: 'failed', status, statusKind: 'error' });
     return { status: 'failed', error: status };
   }
 
-  function warnBeforeUnload(event) {
-    event.preventDefault();
-    event.returnValue = '';
+  // Web Locks are shared by every youtube.com tab and released when a tab
+  // closes or crashes, so a dead tab never blocks the next run.
+  function withRunLock(task) {
+    const locks = root.navigator?.locks;
+    if (!locks) return task();
+    return locks.request(RUN_LOCK, { ifAvailable: true }, (lock) => {
+      if (!lock) {
+        throw new UserError('Another YouTube tab is shuffling or restoring a playlist. Try again when it finishes.');
+      }
+      return task();
+    });
   }
 
   async function exclusive(playlistId, body) {
-    if (running) throw new Error('A run is already in progress.');
+    if (running) throw new UserError('A shuffle or restore is already running in this tab.');
     running = true;
     retryable = null;
-    root.addEventListener('beforeunload', warnBeforeUnload);
+    let job = null;
     try {
-      activeJob = createJob(playlistId);
-      update({
-        phase: 'reading',
-        done: 0,
-        total: 0,
-        status: 'Reading the playlist...',
-        playlistLabel: activeJob.label
+      return await withRunLock(async () => {
+        job = createJob(playlistId);
+        activeJob = job;
+        update({
+          phase: 'reading',
+          done: 0,
+          total: 0,
+          status: 'Reading the playlist...',
+          playlistLabel: job.label
+        });
+        return await body(job);
       });
-      return await body(activeJob);
     } catch (err) {
-      return endWithError(err, activeJob ?? { done: 0, total: 0 });
+      return endWithError(err, job ?? { done: 0, total: 0, changing: false });
     } finally {
       running = false;
       activeJob = null;
@@ -301,9 +424,9 @@
   }
 
   function countWarning(fetched, displayed) {
-    if (displayed === null || displayed === fetched) return '';
-    return `YouTube shows ${displayed} videos but only ${fetched} could be read. `
-      + 'This is normal when some videos are hidden or unavailable.';
+    if (displayed === null || displayed <= fetched) return '';
+    return `${displayed - fetched} of the ${displayed} videos are hidden or unavailable, so YouTube `
+      + 'does not list them. They will not be moved.';
   }
 
   // Asks in the panel when the UI is loaded, and with the browser's dialog otherwise.
@@ -320,8 +443,9 @@
         update({ phase: 'idle', status: 'Nothing to shuffle' });
         return { status: 'nothing' };
       }
+      // Shown in the question rather than logged: Chrome lists console
+      // warnings from extensions on its Errors page.
       const warning = countWarning(items.length, displayedCount);
-      if (warning) console.warn(`[wls] ${warning}`);
       update({ phase: 'confirm', status: '' });
       const confirmed = await askConfirm({
         title: `Shuffle the order of "${job.label}"?`,
@@ -335,6 +459,7 @@
         update({ phase: 'idle', status: '' });
         return { status: 'declined' };
       }
+      job.guard();
       saveBackup(job.playlistId, items);
       const ids = items.map((item) => item.setVideoId);
       return drive(job, ids, core.shuffle(ids), 'Shuffled');
@@ -365,10 +490,12 @@
   }
 
   // Continues a paused run, or retries one that ended with items out of place.
+  // During a run that is not paused there is nothing to do, so repeated
+  // clicks are ignored.
   function resume() {
-    if (activeJob?.resume) return activeJob.resume();
+    if (activeJob) return activeJob.resume?.();
     if (retryable) return retry(retryable);
-    throw new Error('Nothing to resume.');
+    throw new UserError('Nothing to resume.');
   }
 
   async function fetchPlaylist(playlistId = WATCH_LATER) {
@@ -376,45 +503,82 @@
   }
 
   // Restoring from the panel asks first: it is one click away and does not
-  // back up the current order.
-  async function restoreFromPanel(index) {
+  // back up the current order. Backups are found by id, not position, so a
+  // backup saved meanwhile by another tab cannot shift which one is used.
+  async function restoreFromPanel(backupId) {
     const playlistId = currentPlaylistId();
-    const backup = loadBackups(playlistId)[index];
-    if (!backup) throw new Error('That backup is no longer available.');
-    const confirmed = await askConfirm({
-      title: 'Restore this saved order?',
-      message: `This puts the videos in "${playlistLabel(playlistId)}" back in the order saved on `
-        + `${formatDate(backup.createdAt)}, on YouTube and all your devices. Videos added since then `
-        + 'go to the top. The current order is not backed up first.',
-      confirmLabel: 'Restore order'
-    });
-    return confirmed ? restoreFromBackup(backup) : { status: 'declined' };
+    const backup = loadBackups(playlistId).find((entry) => entry.createdAt === backupId);
+    if (!backup) throw new UserError('That backup is no longer available.');
+    restoreQuestion?.abort();
+    const question = new AbortController();
+    restoreQuestion = question;
+    try {
+      const confirmed = await askConfirm({
+        title: 'Restore this saved order?',
+        message: `This puts the videos in "${playlistLabel(playlistId)}" back in the order saved on `
+          + `${formatDate(backup.createdAt)}, on YouTube and all your devices. Videos added since then `
+          + 'go to the top. The current order is not backed up first.',
+        confirmLabel: 'Restore order'
+      }, question.signal);
+      return confirmed ? restoreFromBackup(backup) : { status: 'declined' };
+    } finally {
+      if (restoreQuestion === question) restoreQuestion = null;
+    }
+  }
+
+  function dismissInterrupted() {
+    const playlistId = currentPlaylistId();
+    if (playlistId) clearJournal(playlistId);
+    refreshView();
   }
 
   function reportClickError(err) {
-    console.error('[wls]', err);
+    if (!(err instanceof UserError)) console.error('[wls]', err);
     update({ status: err.message, statusKind: 'error' });
   }
 
-  function watchNavigation() {
+  async function checkOtherTabs() {
+    const locks = root.navigator?.locks;
+    if (!locks?.query) return;
+    try {
+      const { held = [] } = await locks.query();
+      const next = !running && held.some((lock) => lock.name === RUN_LOCK);
+      if (next !== busyElsewhere) {
+        busyElsewhere = next;
+        refreshView();
+      }
+    } catch (err) {
+      log('Could not check other tabs.', err);
+    }
+  }
+
+  function watchPage() {
     const pageKey = () => `${root.location.href}\n${document.title}`;
     let lastKey = pageKey();
     let lastPlaylist = currentPlaylistId();
     const onNavigate = () => {
       lastKey = pageKey();
       const playlistId = currentPlaylistId();
-      // A finished run's message belongs to its playlist, not the next one.
+      // A finished run's message, and an open restore question, belong to
+      // their playlist, not the next one.
       if (!running && playlistId !== lastPlaylist) {
         retryable = null;
+        restoreQuestion?.abort();
         Object.assign(view, { phase: 'idle', done: 0, total: 0, status: '', statusKind: 'info' });
       }
       lastPlaylist = playlistId;
       refreshView();
+      checkOtherTabs();
     };
     document.addEventListener('yt-navigate-finish', onNavigate);
     root.addEventListener('popstate', onNavigate);
+    // Another tab saved a backup or finished a run.
+    root.addEventListener('storage', (event) => {
+      if (event.key === null || event.key.startsWith('wls:')) refreshView();
+    });
     setInterval(() => {
       if (pageKey() !== lastKey) onNavigate();
+      else checkOtherTabs();
     }, 1000);
   }
 
@@ -433,12 +597,14 @@
       const playlistId = currentPlaylistId();
       return playlistId ? run({ playlistId }).catch(reportClickError) : Promise.resolve();
     },
-    onRestore: (index) => restoreFromPanel(index).catch(reportClickError),
+    onRestore: (backupId) => restoreFromPanel(backupId).catch(reportClickError),
     onStop: cancel,
     onResume: () => Promise.resolve().then(resume).catch(reportClickError),
+    onDismiss: dismissInterrupted,
     onReload: () => root.location.reload()
   });
 
-  watchNavigation();
+  watchPage();
   refreshView();
+  checkOtherTabs();
 })(globalThis);

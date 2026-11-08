@@ -18,7 +18,23 @@ This is not YouTube's own Shuffle button. That one plays a playlist in random or
 4. Watch the progress bar. **Stop** is safe at any point: every move leaves a complete playlist, just partly reordered.
 5. When it says Done, click **Reload page** to see the new order.
 
-To undo a shuffle, use the **Backups** list in the same panel. Each backup shows when it was saved and has its own **Restore** button, which asks before changing anything.
+To undo a shuffle, use the **Backups** list in the same panel. Each backup shows when it was saved and has its own **Restore** button, which asks before changing anything. The oldest backup, the order from before your first shuffle, is always kept.
+
+If a shuffle is cut short, for example because the tab was closed, the button says **Last shuffle didn't finish** the next time you open that playlist.
+
+## Safety
+
+Losing a video is treated as unacceptable, and losing the order as something to avoid:
+
+- **Videos can't be removed.** The extension only ever sends "move this video after that one". A check runs right before every request and refuses anything else, so no bug or setting can send a removal. Stopping, closing the tab, a crash or a network failure at any point leaves every video in the playlist.
+- **Nothing changes without a backup.** The current order is saved and read back before the first move. If that fails, the shuffle doesn't start.
+- **The original order is never rotated out.** When there are more backups than `backupsToKeep`, the middle ones go and the oldest stays.
+- **One shuffle at a time, across all tabs.** While one YouTube tab is shuffling or restoring, or waiting for you to confirm, the others say **Busy in another tab** and can't start.
+- **Interrupted runs are reported.** A run that started changing a playlist is recorded until it finishes, so a closed tab or crash shows up the next time the playlist is opened.
+- **Leaving asks first.** Closing or navigating away while the playlist is being changed brings up the browser's "Leave site?" question. Before the first move, nothing has changed, so it doesn't ask.
+- **Nothing hangs.** Requests give up after 30 seconds, and Stop takes effect immediately, even mid-request.
+- **Extra clicks do nothing.** Repeated clicks on Shuffle, Confirm, Restore or Resume start or continue only one run.
+- **Odd settings are corrected.** Values in `wls:config` are checked, and anything invalid falls back to its default.
 
 ## Testing changes
 
@@ -28,14 +44,14 @@ Run the automated tests:
 node --test test/
 ```
 
-`test/core.test.js` covers the pure logic. `test/flow.test.js` runs the real `innertube.js` and `main.js` against a simulated YouTube backend, covering retries, pause and resume, stop, verify and repair, restore, and the panel's wiring. `ui.js` needs a real page, so check it by hand.
+`test/core.test.js` covers the pure logic. `test/flow.test.js` runs the real `innertube.js` and `main.js` against a simulated YouTube backend, covering retries, pause and resume, stop, verify and repair, restore, and the panel's wiring. It also covers the safety cases: several tabs, closed tabs, requests that never answer, repeated clicks and bad settings. One randomized test throws failures at runs and checks that no video is ever lost; run `CHAOS_SEEDS=1000 node --test test/` for a longer search. `ui.js` needs a real page, so check it by hand.
 
 After changing anything that talks to YouTube, repeat these manual tests, signed in, on a throwaway playlist of about 10 videos before using Watch Later:
 
 1. **Read.** In the DevTools console, run `await __wlShuffle.fetchPlaylist('PL...')` with the playlist's id. Expect one item per video, each with a `setVideoId`. If it throws "did not include the setVideoId", see [If reading fails](#if-reading-fails).
 2. **Shuffle** from the panel. Reload and check the order changed and no videos are missing.
 3. **Restore** the latest backup from the panel. Reload and check the original order is back.
-4. **Stop midway.** Run `__wlShuffle.config.delayMs = 1500` to slow it down, shuffle from the panel, then click **Stop**. Reload, check nothing is missing, and restore.
+4. **Stop midway.** Run `Object.assign(__wlShuffle.config, { batchSize: 1, delayMs: 1500 })` to slow it down, shuffle from the panel, then click **Stop**. Reload, check nothing is missing, and restore.
 
 ## If something fails
 
@@ -72,6 +88,7 @@ Checked on 2026-11-06 against client version `2.20261030.02.00`, without signing
 | `yt-action` fallback transport | Partly confirmed | `yt-service-request` is in the client, but the fallback has not been run. |
 | MAIN world injection, `ytcfg`, Trusted Types | Confirmed in Chromium | Loaded on live youtube.com, signed out. |
 | Panel: shuffle, restore, stop, themes, navigation | Confirmed in Chromium | Driven on a live youtube.com playlist page with the playlist requests answered by a mock, on 2026-11-07. |
+| Batched moves | Confirmed by a signed-in test | Batches of 50 were applied in order on 2026-11-07, about 100 times faster than one move per request. YouTube's own client also sends its queued moves in one request. |
 
 ## Updating for YouTube changes
 
@@ -90,13 +107,14 @@ localStorage.setItem('wls:config', JSON.stringify({ debug: true }));
 
 | Key | Default | Purpose |
 | --- | --- | --- |
-| `delayMs` | `150` | Delay between requests |
-| `batchSize` | `1` | Actions per request. Experimental: raise it only after testing on a throwaway playlist. |
+| `delayMs` | `0` | Pause between requests, in milliseconds |
+| `batchSize` | `50` | Moves per request. If YouTube rejects a batch, the run halves the size and carries on. |
 | `maxRetries` | `3` | Retries for network errors, 5xx and 429 before pausing |
+| `requestTimeoutMs` | `30000` | How long to wait for YouTube before treating a request as a network error |
 | `transport` | `'fetch'` | Set to `'ytAction'` to let YouTube's own app send moves if auth keeps failing |
 | `authParts` | all three | Which `SAPISID*HASH` parts to send |
 | `sendClientHeaders` | `false` | Send `X-YouTube-Client-Name` and `X-YouTube-Client-Version` |
-| `backupsToKeep` | `3` | Backups kept in `localStorage` per playlist |
+| `backupsToKeep` | `3` | Backups kept in `localStorage` per playlist, at least 2. The oldest is always one of them. |
 | `debug` | `false` | Log progress to the console |
 
 ## Console API
@@ -117,9 +135,9 @@ A run started from the console still opens the panel, and asks its question ther
 
 ## Good to know
 
-- **Keep the tab open, and preferably in view, during long runs.** Chrome throttles timers in background tabs, so a run slows down sharply there. It stays safe, just slow. Closing the tab asks first.
+- **Keep the tab open until a run finishes.** It can be in the background.
+- **Hidden and unavailable videos are not moved.** YouTube's count includes deleted and private videos but doesn't list them, so the question before a shuffle says how many will stay where they are.
+- **Console output is quiet by default.** Only real failures are logged, so Chrome's extension Errors page stays meaningful. Set `debug` to see progress.
 - **You can browse elsewhere on YouTube during a run.** The panel stays visible and keeps going.
-- **Backups live only in this browser,** in youtube.com's `localStorage`, newest first. Clearing YouTube's site data deletes them, and only the last `backupsToKeep` are kept per playlist.
-- **A shuffle never runs without a backup.** If the backup can't be saved, for example because storage is full, the run stops before changing anything.
-- **Restore does not create a new backup,** so repeated restores keep returning to the same order. After two shuffles, the newest backup is the first shuffled order: restore the older one to get further back.
-- **Stopping never loses videos.** Each move leaves a valid playlist, only partly reordered.
+- **Backups live only in this browser,** in youtube.com's `localStorage`. Clearing YouTube's site data deletes them.
+- **Restore does not create a new backup,** so repeated restores keep returning to the same order. After two shuffles, the newest backup is the first shuffled order: restore an older one to get further back.

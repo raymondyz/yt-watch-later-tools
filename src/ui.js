@@ -140,6 +140,13 @@
     .btn:hover { background: var(--surface-hover); }
     .btn.primary { background: var(--accent); color: var(--accent-text); }
     .btn.primary:hover { background: var(--accent-hover); }
+    .btn:disabled { opacity: 0.5; cursor: default; }
+    .btn:disabled:hover { background: var(--surface); }
+    .btn.primary:disabled:hover { background: var(--accent); }
+    .notice { margin-top: 12px; padding: 12px; border-radius: 8px; background: var(--warn-bg); color: var(--warn-text); }
+    .notice > * + * { margin-top: 6px; }
+    .notice .row { margin-top: 10px; }
+    .note { margin-top: 12px; }
     .backups { margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--border); }
     .backups .small { margin-top: 2px; }
     ul { margin: 4px 0 0; padding: 0; list-style: none; }
@@ -231,6 +238,19 @@
     const target = el('strong');
     const targetLine = el('p', { class: 'target' }, [el('span', { class: 'muted', text: 'Playlist: ' }), target]);
 
+    const noticeTitle = el('h3');
+    const noticeMessage = el('p');
+    const notice = el('section', { class: 'notice', role: 'status' }, [
+      noticeTitle,
+      noticeMessage,
+      el('div', { class: 'row' }, [button('Dismiss', '', () => handlers.onDismiss?.())])
+    ]);
+    const busyNote = el('p', {
+      class: 'note muted',
+      text: 'Another YouTube tab is shuffling or restoring a playlist, or waiting for you to confirm one. '
+        + 'You can start here when it finishes.'
+    });
+
     const confirmTitle = el('h3');
     const confirmMessage = el('p');
     const confirmWarning = el('p', { class: 'warning' });
@@ -286,6 +306,8 @@
       ]),
       explain,
       targetLine,
+      notice,
+      busyNote,
       confirmBox,
       status,
       progress,
@@ -304,6 +326,10 @@
       explain,
       target,
       targetLine,
+      notice,
+      noticeTitle,
+      noticeMessage,
+      busyNote,
       confirmBox,
       confirmTitle,
       confirmMessage,
@@ -349,31 +375,40 @@
       case 'running': return `Moving ${state.done} / ${state.total}`;
       case 'verifying': return 'Checking the new order...';
       case 'paused': return 'Paused';
-      default: return 'Shuffle playlist order';
+      default:
+        if (state.busyElsewhere) return 'Busy in another tab';
+        if (state.interrupted) return state.interrupted.title;
+        return 'Shuffle playlist order';
     }
+  }
+
+  function restoreButton(backup) {
+    const node = el('button', {
+      type: 'button',
+      class: 'btn',
+      text: 'Restore',
+      'aria-label': `Restore the order saved on ${backup.label}`,
+      click: () => handlers.onRestore?.(backup.id)
+    });
+    node.disabled = Boolean(state.busyElsewhere);
+    return node;
   }
 
   function renderBackups() {
     const backups = state.backups ?? [];
-    const key = JSON.stringify(backups);
+    const key = JSON.stringify([backups, Boolean(state.busyElsewhere)]);
     if (key === backupsKey) return;
     backupsKey = key;
     ui.backupEmpty.hidden = backups.length > 0;
-    ui.backupList.replaceChildren(...backups.map((backup, index) => el('li', {}, [
+    ui.backupList.replaceChildren(...backups.map((backup) => el('li', {}, [
       el('div', { class: 'meta' }, [
         el('span', { text: backup.label }),
         el('span', {
           class: 'muted small',
-          text: `${backup.count} videos${index === 0 ? ', latest' : ''}`
+          text: `${backup.count} videos${backup.note ? `, ${backup.note}` : ''}`
         })
       ]),
-      el('button', {
-        type: 'button',
-        class: 'btn',
-        text: 'Restore',
-        'aria-label': `Restore the order saved on ${backup.label}`,
-        click: () => handlers.onRestore?.(index)
-      })
+      restoreButton(backup)
     ])));
   }
 
@@ -404,6 +439,8 @@
     if (active && !wasActive) isOpen = true;
     wasActive = active;
 
+    // Put the panel back if the page ever removes it.
+    if (!ui.host.isConnected && document.body) document.body.append(ui.host);
     ui.host.style.display = state.visible || confirming ? '' : 'none';
     ui.wrap.dataset.theme = document.documentElement.hasAttribute('dark') ? 'dark' : 'light';
     ui.fabLabel.textContent = fabText();
@@ -424,6 +461,14 @@
     renderProgress(!confirming && (WORKING.has(phase) || phase === 'paused') && state.total > 0);
 
     const idle = !active;
+    const notice = idle ? state.interrupted : null;
+    ui.notice.hidden = !notice;
+    if (notice) {
+      ui.noticeTitle.textContent = notice.title;
+      ui.noticeMessage.textContent = notice.message;
+    }
+    ui.busyNote.hidden = !(idle && state.busyElsewhere);
+    ui.shuffle.disabled = Boolean(state.busyElsewhere);
     ui.shuffle.hidden = !idle;
     ui.resume.hidden = confirming || phase !== 'paused';
     ui.retry.hidden = !idle || !state.canRetry;

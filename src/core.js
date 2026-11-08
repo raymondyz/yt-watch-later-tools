@@ -88,6 +88,30 @@
     return moves;
   }
 
+  // The extension only ever moves videos, and a move cannot remove one. This
+  // refuses anything else before it is sent, so no code path can delete a
+  // video. When `known` is given, every id an action mentions must be in it.
+  function assertMoveOnly(actions, known = null) {
+    const fields = new Set(['action', 'setVideoId', INNERTUBE.predecessorField]);
+    const isKnown = (id) => typeof id === 'string' && (known === null || known.has(id));
+    const safe = Array.isArray(actions) && actions.length > 0 && actions.every((action) => {
+      const after = action?.[INNERTUBE.predecessorField];
+      return action?.action === INNERTUBE.moveAfterAction
+        && Object.keys(action).every((key) => fields.has(key))
+        && isKnown(action.setVideoId)
+        && (after === undefined || (isKnown(after) && after !== action.setVideoId));
+    });
+    if (!safe) throw new Error('Refused to send a playlist edit that is not a plain move.');
+  }
+
+  // Backups are newest first. Past the limit the middle ones go, because the
+  // oldest is the order from before the first shuffle and is always kept.
+  function keepBackups(backups, limit) {
+    const max = Math.max(2, limit);
+    if (backups.length <= max) return backups;
+    return [...backups.slice(0, max - 1), backups[backups.length - 1]];
+  }
+
   function toAction(move) {
     const action = { action: INNERTUBE.moveAfterAction, setVideoId: move.setVideoId };
     if (move.after !== null) action[INNERTUBE.predecessorField] = move.after;
@@ -245,6 +269,8 @@
     shuffle,
     applyMove,
     planMoves,
+    assertMoveOnly,
+    keepBackups,
     toAction,
     parsePlaylistPage,
     parseDisplayedCount,

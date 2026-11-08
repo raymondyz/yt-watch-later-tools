@@ -7,9 +7,10 @@
   const CONFIG_KEY = 'wls:config';
 
   const DEFAULT_CONFIG = {
-    delayMs: 150,
-    batchSize: 1,
+    delayMs: 0,
+    batchSize: 50,
     maxRetries: 3,
+    requestTimeoutMs: 30000,
     transport: 'fetch',
     authParts: ['SAPISIDHASH', 'SAPISID1PHASH', 'SAPISID3PHASH'],
     sendClientHeaders: false,
@@ -17,12 +18,43 @@
     debug: false
   };
 
+  // Allowed range for each number. backupsToKeep is at least 2 so the
+  // original order is never rotated out.
+  const NUMBER_LIMITS = {
+    delayMs: [0, 60000],
+    batchSize: [1, 500],
+    maxRetries: [0, 10],
+    requestTimeoutMs: [1000, 300000],
+    backupsToKeep: [2, 20]
+  };
+
+  // Settings come from localStorage, which anyone can edit, so every value is
+  // checked and a bad one falls back to its default.
+  function sanitizeConfig(raw) {
+    const config = { ...DEFAULT_CONFIG, ...(raw && typeof raw === 'object' ? raw : {}) };
+    for (const [key, [min, max]] of Object.entries(NUMBER_LIMITS)) {
+      const value = Number(config[key]);
+      config[key] = Number.isFinite(value) ? Math.min(max, Math.max(min, Math.floor(value))) : DEFAULT_CONFIG[key];
+    }
+    if (!['fetch', 'ytAction'].includes(config.transport)) config.transport = DEFAULT_CONFIG.transport;
+    if (!Array.isArray(config.authParts)) config.authParts = DEFAULT_CONFIG.authParts;
+    config.sendClientHeaders = config.sendClientHeaders === true;
+    config.debug = config.debug === true;
+    return config;
+  }
+
   function loadConfig() {
+    let text = null;
     try {
-      return { ...DEFAULT_CONFIG, ...JSON.parse(localStorage.getItem(CONFIG_KEY)) };
+      text = localStorage.getItem(CONFIG_KEY);
+    } catch (err) {
+      // Storage is blocked: run with the defaults.
+    }
+    try {
+      return sanitizeConfig(JSON.parse(text));
     } catch (err) {
       console.warn(`[wls] Ignoring invalid ${CONFIG_KEY}.`, err);
-      return { ...DEFAULT_CONFIG };
+      return sanitizeConfig(null);
     }
   }
 
@@ -64,7 +96,9 @@
     return err instanceof EditRejectedError || (err instanceof HttpError && err.status === 400);
   }
 
+  // No delay means no timer at all: Chrome throttles timers in background tabs.
   function sleep(ms, signal) {
+    if (ms <= 0) return Promise.resolve();
     return new Promise((resolve) => {
       const finish = () => {
         clearTimeout(timer);
@@ -74,6 +108,12 @@
       const timer = setTimeout(finish, ms);
       signal?.addEventListener('abort', finish);
     });
+  }
+
+  // The fallback transport gets no answer to wait for, so its requests are
+  // spaced out instead.
+  function requestGap() {
+    return CONFIG.transport === 'ytAction' ? Math.max(CONFIG.delayMs, 1000) : CONFIG.delayMs;
   }
 
   function cfg(key) {
@@ -120,7 +160,7 @@
       const hash = await sha1Hex(`${signedPrefix}${ts} ${value} ${IT.origin}`);
       parts.push(`${label} ${ts}_${hash}${suffix}`);
     }
-    if (parts.length === 0) throw new Error('No SAPISID cookie found. Are you signed in?');
+    if (parts.length === 0) throw new Error('You need to be signed in to YouTube to do this.');
     return parts.join(' ');
   }
 
@@ -140,20 +180,30 @@
     return headers;
   }
 
-  async function innertubePost(path, body) {
+  // Every request gives up after requestTimeoutMs, and also ends as soon as
+  // `signal` aborts, so Stop never waits on a request that hangs.
+  function requestSignal(signal) {
+    const timeout = AbortSignal.timeout?.(CONFIG.requestTimeoutMs);
+    if (!signal || !timeout) return signal ?? timeout;
+    return AbortSignal.any ? AbortSignal.any([signal, timeout]) : timeout;
+  }
+
+  async function innertubePost(path, body, signal) {
     const request = {
       method: 'POST',
       credentials: 'same-origin',
       headers: await buildHeaders(),
-      body: JSON.stringify({ context: cfg(IT.contextKey), ...body })
+      body: JSON.stringify({ context: cfg(IT.contextKey), ...body }),
+      signal: requestSignal(signal)
     };
     try {
       const res = await fetch(`${IT.apiBase}${path}?prettyPrint=false`, request);
       if (!res.ok) throw new HttpError(res.status, await res.text());
       return await res.json();
     } catch (err) {
-      if (err instanceof HttpError) throw err;
-      throw new NetworkError(err.message);
+      if (err instanceof HttpError || signal?.aborted) throw err;
+      const timedOut = err?.name === 'TimeoutError';
+      throw new NetworkError(timedOut ? `no answer within ${CONFIG.requestTimeoutMs / 1000} s` : err.message);
     }
   }
 
@@ -168,6 +218,10 @@
       try {
         return await send();
       } catch (err) {
+        if (signal?.aborted) {
+          guard();
+          throw err;
+        }
         if (isAuthFailure(err) && !authRetried) {
           authRetried = true;
           continue;
@@ -186,7 +240,7 @@
     let displayedCount = null;
     let unmovable = 0;
     while (true) {
-      const json = await withRetries(() => innertubePost(IT.browsePath, body), options);
+      const json = await withRetries(() => innertubePost(IT.browsePath, body, options.signal), options);
       const page = core.parsePlaylistPage(json);
       const isFirstPage = seenTokens.size === 0;
       const sizeBefore = items.size;
@@ -229,12 +283,15 @@
     }));
   }
 
-  async function editPlaylist(playlistId, actions) {
+  // The only way this extension changes a playlist. Both transports go
+  // through the move-only check first.
+  async function editPlaylist(playlistId, actions, { signal, known = null } = {}) {
+    core.assertMoveOnly(actions, known);
     if (CONFIG.transport === 'ytAction') {
       sendViaYtAction(playlistId, actions);
       return;
     }
-    const json = await innertubePost(IT.editPlaylistPath, { playlistId, actions });
+    const json = await innertubePost(IT.editPlaylistPath, { playlistId, actions }, signal);
     if (!core.isEditSuccess(json)) throw new EditRejectedError();
   }
 
@@ -245,6 +302,7 @@
     isAuthFailure,
     isRejection,
     sleep,
+    requestGap,
     readSession,
     withRetries,
     readPlaylist,
